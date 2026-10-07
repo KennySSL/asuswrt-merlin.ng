@@ -94,20 +94,43 @@ jobs:
         ARTIFACTS_DIR: "/project/artifacts"
         CHANGELOG_FILE: "/tmp/CHANGELOG"
         PROJECTBASEDIR: "/project"
-      options: --user root
+      options: --user docker
       volumes:
         - /mnt:/project
 
     steps:
       # ---------------------------------------------------------------------
-      # /mnt kommt als root daher, der User 'docker' darf dort nicht schreiben.
-      # gnutons Workflow umgeht das mit einem sudo ln nach /opt; fuer den Clone
-      # brauchen wir die Rechte direkt.
+      # Rechte fuer /project.
+      #
+      # WICHTIG: Der Container laeuft als User 'docker', NICHT als root. Grund
+      # ist nicht Bequemlichkeit: make.common:prebuild_checks bricht jeden
+      # Root-Build ab --
+      #     if [ $(shell whoami) == root ]; then
+      #       echo "ERROR: Attempting to build as root."; exit 1;
+      # Vorher sind 45 Minuten ins Log gelaufen, in denen der eigentliche
+      # Fehler stand.
+      #
+      # /mnt gehoert dem Runner, 'docker' darf dort nicht schreiben. gnutons
+      # Datei loest das mit sudo chown (github-actions.yml:53); wir uebernehmen
+      # das unveraendert.
+      #
+      # Die Schreibprobe am Ende ist nicht Beiwerk: schlaegt sie fehl, bricht
+      # der git clone in Schritt 4 mit einem Rechtefehler ab, der nichts mit
+      # dem eigentlichen Problem zu tun hat.
       - name: Projektverzeichnis vorbereiten
         run: |
-          mkdir -p "${PROJECTBASEDIR}" "${ARTIFACTS_DIR}"
-          chmod 777 "${PROJECTBASEDIR}"
+          sudo mkdir -p "${PROJECTBASEDIR}" "${ARTIFACTS_DIR}"
+          sudo chown -R docker:docker "${PROJECTBASEDIR}"
           ls -ld /mnt "${PROJECTBASEDIR}"
+          echo "  ich bin: $(id)"
+          if touch "${PROJECTBASEDIR}/.writetest" 2>/dev/null; then
+            rm -f "${PROJECTBASEDIR}/.writetest"
+            echo "  OK: ${PROJECTBASEDIR} ist beschreibbar"
+          else
+            echo "FEHLER: ${PROJECTBASEDIR} ist nicht beschreibbar."
+            echo "       Der git clone in Schritt 4 wuerde daran scheitern."
+            exit 1
+          fi
 
       # ---------------------------------------------------------------------
       - name: Quellcode holen
@@ -280,10 +303,59 @@ jobs:
       # ---------------------------------------------------------------------
       # mqvpn holen. BoringSSL und xquic kommen als Submodule von mqvpn mit --
       # das ist die Reihenfolge, die das mqvpn-CMake erwartet.
+      #
+      # Diese Submodule werden rekursiv geklont und das ist der mit Abstand
+      # teuerste Punkt der Kette: gemessen rund 45 Minuten, bei einem Lauf
+      # von 47 Minuten Gesamtlaenge. Da sich an den Quellen zwischen zwei
+      # Build-Versuchen nichts aendert, wird das Ergebnis wiederverwendet.
+      #
+      # Die Pfade muessen absolut sein: actions/cache expandiert keine
+      # Shell-Variablen, und ${PROJECT_DIR} ist ein Container-Env, kein
+      # GitHub-Kontext. Die Werte muessen mit PROJECT_DIR aus dem
+      # container.env uebereinstimmen -- deshalb beide genannt.
+      - name: mqvpn-Quellen cachen
+        id: mqvpn-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            /project/asuswrt-merlin.ng/release/src/router/mqvpn
+            /project/asuswrt-merlin.ng/release/src/router/libevent2-2.1.12
+          # hashFiles ueber fetch-sources.sh: aendert sich die Datei, ist der
+          # Cache ungueltig und die Quellen werden neu geholt. Ein fester
+          # String waere hier ein stiller Fehler.
+          key: mqvpn-src-${{ runner.os }}-${{ hashFiles('integration/fetch-sources.sh') }}
+
       - name: mqvpn-Quellen holen
         run: |
           set -euo pipefail
           cd ${PROJECT_DIR}
+
+          if [ "${{ steps.mqvpn-cache.outputs.cache-hit }}" = "true" ]; then
+            echo "Cache-Treffer: Quellen werden nicht neu geholt."
+            # Vollstaendigkeit pruefen, statt zu vertrauen. Ein halb
+            # wiederhergestellter Cache, aus dem ein BoringSSL fehlt,
+            # scheitert spaeter im Build an einer CMake-Meldung, die nach
+            # einem mqvpn-Fehler aussieht und keiner ist.
+            fail=0
+            for p in \
+              release/src/router/mqvpn \
+              release/src/router/libevent2-2.1.12 \
+              release/src/router/mqvpn/third_party/xquic \
+              release/src/router/mqvpn/third_party/xquic/third_party/boringssl
+            do
+              if [ -d "$p" ]; then
+                printf '  %-72s %s Eintraege\n' "$p" "$(ls -A "$p" 2>/dev/null | wc -l)"
+              else
+                echo "  FEHLT im Cache: $p"
+                fail=1
+              fi
+            done
+            [ "$fail" -eq 0 ] || { echo "Cache unvollstaendig -- Abbruch."; exit 1; }
+            echo "  OK: mqvpn, xquic, BoringSSL und libevent vollstaendig."
+            exit 0
+          fi
+
+          echo "Kein Cache-Treffer: Quellen werden geholt (das dauert ~45 min)."
           bash integration/fetch-sources.sh
 
       # ---------------------------------------------------------------------
@@ -407,7 +479,9 @@ jobs:
           fi
 
           echo "----- hack-ish fix ---------"
-          # Wir laufen mit --user root; sudo gibt es nicht ueberall im Image.
+          # Wir laufen als 'docker', nicht als root -- make.common:prebuild_checks
+          # verweigert jeden Root-Build. Beide Zweige bleiben, damit der
+          # Schritt auch unter sudo oder als root sinnvoll bleibt.
           if [ "$(id -u)" -eq 0 ]; then
             ln -sf /home/docker/am-toolchains/brcm-arm-hnd /opt/toolchains
           else
