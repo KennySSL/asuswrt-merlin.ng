@@ -515,6 +515,26 @@ jobs:
           fi
           set -u
 
+          echo "----- CMake >= 3.22 fuer BoringSSL -----"
+          # Der Container hat CMake 3.16.3; BoringSSL verlangt 3.22+
+          # (CMakeLists.txt:15). Ein aktuelles CMake kommt als Tarball ins
+          # Home von 'docker' -- kein Root, kein apt, kein GITHUB_PATH.
+          CMAKE_VER=3.28.6
+          CMAKE_DIR="$HOME/cmake-${CMAKE_VER}-linux-x86_64"
+          if [ ! -x "$CMAKE_DIR/bin/cmake" ]; then
+            CMAKE_URL="https://github.com/Kitware/CMake/releases/download/v${CMAKE_VER}/cmake-${CMAKE_VER}-linux-x86_64.tar.gz"
+            if command -v curl >/dev/null 2>&1; then
+              curl -fsSL "$CMAKE_URL" -o /tmp/cmake.tgz
+            else
+              wget -q "$CMAKE_URL" -O /tmp/cmake.tgz
+            fi
+            tar -xzf /tmp/cmake.tgz -C "$HOME"
+            rm -f /tmp/cmake.tgz
+          fi
+          export PATH="$CMAKE_DIR/bin:$PATH"
+          cmake --version | head -1
+          cmake --version | head -1 | grep -q " 3\.28\."             || { echo "FEHLER: neues CMake nicht aktiv"; exit 1; }
+
           echo "----- hack-ish fix ---------"
           # Wir laufen als 'docker', nicht als root -- make.common:prebuild_checks
           # verweigert jeden Root-Build. Beide Zweige bleiben, damit der
