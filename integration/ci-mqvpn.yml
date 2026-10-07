@@ -216,9 +216,27 @@ jobs:
           echo "  OK: ${PDIR}"
           ls -l "${PDIR}/${PROFILE}" 2>/dev/null | sed 's|^|  |' || true
 
-          # Ab hier ist ${PROFILE} die Wahrheit. Nachfuehrende Schritte lesen
-          # ihn aus GITHUB_ENV, damit MODEL/PROFILE nicht auseinanderlaufen.
-          echo "PROFILE=${PROFILE}" >> "${GITHUB_ENV}"
+          # Ab hier ist ${PROFILE} die Wahrheit.
+          #
+          # NICHT GITHUB_ENV. Diese Variable zeigt auf eine Datei, die der
+          # Runner auf dem Host anlegt; der laeuft als root, der Container
+          # als 'docker'. Beleg aus Lauf 37640170230, Schritt 5:
+          #   /__w/_temp/_runner_file_commands/set_env_...: Permission denied
+          # Der Lauf fiel an dieser einen Zeile um, nachdem alles davor
+          # gruen war.
+          #
+          # gnutons Datei schreibt ebenfalls nach GITHUB_ENV (Zeile 200).
+          # Darauf verlassen wir uns nicht: was der Runner gerade fuer
+          # Rechte vergibt, ist nicht unter unserer Kontrolle, und ein
+          # stillschweigender Rueckfall auf den Container-Env-Wert waere
+          # genau die Sorte Fehler, die erst Wochen spaeter auffaellt.
+          # Deshalb eine eigene Datei unter /project -- da haben wir die
+          # Rechte gesetzt.
+          STATE_DIR="${PROJECTBASEDIR}/.ci-state"
+          mkdir -p "${STATE_DIR}"
+          printf 'PROFILE=%s\n' "${PROFILE}" > "${STATE_DIR}/env"
+          echo "  hinterlegt: ${STATE_DIR}/env"
+          sed 's/^/    /' "${STATE_DIR}/env"
 
       # ---------------------------------------------------------------------
       # ---------------------------------------------------------------------
@@ -606,6 +624,27 @@ jobs:
         if: always()
         run: |
           SDKDIR="${PROJECT_DIR}/release/${SDK}"
+
+          # ${PROFILE} muss aus dem Schritt stammen, der ihn aus target.mak
+          # aufgeloest hat. Fehlt die Datei, ist das ein Fehler und kein
+          # Anlass, auf den Container-Env-Wert zurueckzufallen: dann waere
+          # jede Aussage ueber fs.install geraten, und genau eine solche
+          # unbeabsichtigte Ersetzung hat in diesem Projekt schon einmal
+          # 47 Minuten verschluckt.
+          STATE="${PROJECTBASEDIR}/.ci-state/env"
+          if [ ! -f "${STATE}" ]; then
+            echo "FEHLER: ${STATE} fehlt."
+            echo "       'Modell und Build-Profil gegen den Baum pruefen' hat den"
+            echo "       aufgeloesten PROFILE-Wert nicht hinterlegt."
+            exit 1
+          fi
+          . "${STATE}"
+          echo "  PROFILE aus dem vorigen Schritt: ${PROFILE}"
+          [ -d "${SDKDIR}/targets/${PROFILE}" ] || {
+            echo "FEHLER: ${SDKDIR}/targets/${PROFILE} existiert nicht."
+            exit 1
+          }
+
           PROFILE_DIR="${SDKDIR}/targets/${PROFILE}"
           INSTALL_DIR="${PROFILE_DIR}/fs.install"
           fail=0
