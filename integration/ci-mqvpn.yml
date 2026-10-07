@@ -348,13 +348,18 @@ jobs:
           set -euo pipefail
           cd ${PROJECT_DIR}
 
+          # Der Cache wird benutzt, wenn er da ist UND vollstaendig ist.
+          # Sonst holen wir die Quellen. Ein unbrauchbarer Cache ist ein
+          # Aerger, kein Grund anzuhalten.
+          #
+          # Vollstaendig heisst: alle vier Pfade muessen existieren. Ein halb
+          # wiederhergestellter Cache, aus dem BoringSSL fehlt, scheitert
+          # spaeter als CMake-Meldung, die nach einem mqvpn-Fehler aussieht
+          # und keiner ist.
+          USE_CACHE=no
           if [ "${{ steps.mqvpn-cache.outputs.cache-hit }}" = "true" ]; then
-            echo "Cache-Treffer: Quellen werden nicht neu geholt."
-            # Vollstaendigkeit pruefen, statt zu vertrauen. Ein halb
-            # wiederhergestellter Cache, aus dem ein BoringSSL fehlt,
-            # scheitert spaeter im Build an einer CMake-Meldung, die nach
-            # einem mqvpn-Fehler aussieht und keiner ist.
-            fail=0
+            echo "Cache-Treffer: Vollstaendigkeit wird geprueft."
+            missing=0
             for p in \
               release/src/router/mqvpn \
               release/src/router/libevent2-2.1.12 \
@@ -365,16 +370,37 @@ jobs:
                 printf '  %-72s %s Eintraege\n' "$p" "$(ls -A "$p" 2>/dev/null | wc -l)"
               else
                 echo "  FEHLT im Cache: $p"
-                fail=1
+                missing=1
               fi
             done
-            [ "$fail" -eq 0 ] || { echo "Cache unvollstaendig -- Abbruch."; exit 1; }
-            echo "  OK: mqvpn, xquic, BoringSSL und libevent vollstaendig."
+            if [ "$missing" -eq 0 ]; then
+              echo "  OK: mqvpn, xquic, BoringSSL und libevent vollstaendig."
+              USE_CACHE=yes
+            else
+              echo "  Cache unvollstaendig -- Quellen werden stattdessen geholt."
+            fi
+          else
+            echo "Kein Cache-Treffer."
+          fi
+
+          if [ "$USE_CACHE" = "yes" ]; then
+            echo "  ueberspringe fetch-sources.sh"
             exit 0
           fi
 
-          echo "Kein Cache-Treffer: Quellen werden geholt (das dauert ~45 min)."
+          echo "Quellen werden geholt (das dauert ~45 min)."
           bash integration/fetch-sources.sh
+
+          # Nachkontrolle: fetch-sources.sh beendet sich mit 0, auch wenn ein
+          # Teilschlag fehlgeschlagen ist und nur gewarnt wurde. Genau diese
+          # Faelle waeren sonst erst im Build aufgefallen.
+          echo "--- Nachkontrolle ---"
+          for p in release/src/router/mqvpn \
+                    release/src/router/libevent2-2.1.12 \
+                    release/src/router/mqvpn/third_party/xquic/third_party/boringssl; do
+            [ -d "$p" ] || { echo "FEHLT nach dem Holen: $p"; exit 1; }
+          done
+          echo "  OK: alle Quellen liegen da."
 
       # ---------------------------------------------------------------------
       # In den Router-Baum einhaengen (obj-y) und die Regeln bereitstellen.
