@@ -47,21 +47,38 @@ jobs:
         ARTIFACTS_DIR: "/project/artifacts"
         CHANGELOG_FILE: "/tmp/CHANGELOG"
         PROJECTBASEDIR: "/project"
-      options: --user docker
+      options: --user root
       volumes:
         - /mnt:/project
 
     steps:
       # ---------------------------------------------------------------------
+      # /mnt kommt als root daher, der User 'docker' darf dort nicht schreiben.
+      # gnutons Workflow umgeht das mit einem sudo ln nach /opt; fuer den Clone
+      # brauchen wir die Rechte direkt.
+      - name: Projektverzeichnis vorbereiten
+        run: |
+          mkdir -p "${PROJECTBASEDIR}" "${ARTIFACTS_DIR}"
+          chmod 777 "${PROJECTBASEDIR}"
+          ls -ld /mnt "${PROJECTBASEDIR}"
+
+      # ---------------------------------------------------------------------
       - name: Quellcode holen
         run: |
           cd ${PROJECTBASEDIR}
+          rm -rf asuswrt-merlin.ng
           if [[ $GITHUB_REF_TYPE == "tag" ]]; then
             export TAG="${GITHUB_REF#refs/tags/}"
           else
             export BRANCH="${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}"
           fi
           git clone --depth 1 --branch "${TAG:-$BRANCH}" "$GIT_REPO" asuswrt-merlin.ng
+          cd asuswrt-merlin.ng
+          echo "--- geklont ---"
+          git log -1 --format='%h %s'
+          # integration/ muss im geklonten Baum liegen, sonst brechen die
+          # naechsten Schritte ab.
+          ls -d integration .github/workflows 2>&1
 
       # ---------------------------------------------------------------------
       - name: Toolchain fuer SDK setzen
