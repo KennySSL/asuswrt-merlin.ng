@@ -198,12 +198,84 @@ jobs:
           echo "PROFILE=${PROFILE}" >> "${GITHUB_ENV}"
 
       # ---------------------------------------------------------------------
+      # ---------------------------------------------------------------------
+      # TUF_UI einschalten.
+      #
+      # TUF_UI=y ist kein Schalter, sondern ein Overlay. Beleg aus
+      # release/src/router/www/Makefile:105, :763 und :992:
+      #   - www/sysdep/FUNCTION/TUF_UI/* wird ueber www/ gelegt. 154 Dateien,
+      #     darunter state.js, index.asp, das TUF-Logo und die Menue-Icons.
+      #   - require/menuTrees/menuTree_TUF.js wird zu modules/menuTree.js.
+      #   - www/css/TUF/* wird ueber www/css/ gelegt.
+      #   - RTCONFIG_OPEN_NAT wird mit aktiviert (src-rt/Makefile:2704).
+      # Das ist der ASUS-TUF-Auftritt, den wir wollen.
+      #
+      # Fuer WAN3 wichtig: Advanced_WANPort_Content.asp liegt NICHT im
+      # TUF_UI-Baum und bleibt unberuehrt. state.js dagegen nicht -- die
+      # benutzte Fassung ist kuenftig sysdep/FUNCTION/TUF_UI/state.js.
+      #
+      # Warum dieser Schritt so lang ist: der vorherige ist zweimal still
+      # gescheitert. Einmal mit falschem Pfad (Abbruch nach 47 Minuten
+      # Laufzeit), einmal waere ein trefferloses sed ein Erfolg mit
+      # falschem Ergebnis gewesen. Beides wird hier geprueft statt
+      # angenommen.
+      # ---------------------------------------------------------------------
       - name: TUI aktivieren
+        env:
+          PROFILE: 96756GW
         run: |
-          if [[ $UI == "tuf" ]]; then
-            echo "TUF_UI=n -> y"
-            sed -i 's/TUF_UI=n/TUF_UI=y/' ${PROJECT_DIR}/release/src/target.mak
+          if [ "${UI:-}" != "tuf" ]; then
+            echo "UI=${UI:-} ist nicht tuf -- TUF_UI bleibt unveraendert."
+            exit 0
           fi
+
+          # Derselbe Pfad, den Schritt 5 erfolgreich liest.
+          TM="${PROJECT_DIR}/release/${SDK}/target.mak"
+          if [ ! -f "${TM}" ]; then
+            echo "FEHLER: target.mak fehlt: ${TM}"
+            echo "       Vorhandene target.mak im Baum:"
+            find "${PROJECT_DIR}/release" -maxdepth 2 -name target.mak 2>/dev/null | sed "s|^|         |"
+            exit 1
+          fi
+          echo "  target.mak : ${TM}"
+          echo "  aufgeloest : $(readlink -f "${TM}")"
+
+          # MODEL=tuf-ax3000_v2 -> TUF-AX3000_V2
+          #
+          # Nur gross schreiben. KEIN Unterstrich-zu-Bindestrich: das Profil
+          # heisst in target.mak ausdruecklich TUF-AX3000_V2 mit Unterstrich
+          # (src-rt/target.mak:491). Ein Bindestrich ergaebe TUF-AX3000-V2,
+          # wofuer es keine Zeile gibt -- das sed waere dann wirkungslos.
+          # Der Test gegen die echte Datei hat genau diesen Fehler gefunden.
+          MODEL_TAG="$(printf "%s" "${MODEL}" | tr "[:lower:]" "[:upper:]")"
+          echo "  Modell-Tag : ${MODEL_TAG}"
+
+          echo "  --- vorher ---"
+          grep -n "^export[[:space:]]\+${MODEL_TAG}[[:space:]]*+=" "${TM}" | grep "TUF_UI" | sed "s|^|    |" || true
+          BEFORE="$(grep -c "TUF_UI=y" "${TM}" || true)"
+
+          # Nur die +=-Zeilen unseres Modells, und nur dort TUF_UI=n -> y.
+          # Die Basiszeile (491) nutzt := statt += und wird nicht beruehrt.
+          sed -i "/^export[[:space:]]\+${MODEL_TAG}[[:space:]]*+=/ s/\([[:space:]]\)TUF_UI=n\([[:space:]]\|$\)/\1TUF_UI=y\2/g" "${TM}"
+
+          AFTER="$(grep -c "TUF_UI=y" "${TM}" || true)"
+          echo "  --- nachher ---"
+          grep -n "^export[[:space:]]\+${MODEL_TAG}[[:space:]]*+=" "${TM}" | grep "TUF_UI" | sed "s|^|    |" || true
+          echo "  Zeilen mit TUF_UI=y : vorher ${BEFORE}, nachher ${AFTER}"
+
+          if [ "${BEFORE}" = "${AFTER}" ]; then
+            echo "FEHLER: sed hat nichts geaendert."
+            echo "       Der Build waere mit TUF_UI=n weitergelaufen und der"
+            echo "       Unterschied faellt erst an der Oberflaeche auf, nicht"
+            echo "       hier. Deshalb Abbruch statt Durchwinken."
+            exit 1
+          fi
+
+          if ! grep -q "^export[[:space:]]\+${MODEL_TAG}[[:space:]]*+=.*TUF_UI=y" "${TM}"; then
+            echo "FEHLER: ${MODEL_TAG} traegt trotzdem kein TUF_UI=y."
+            exit 1
+          fi
+          echo "  OK: TUF_UI=y sitzt jetzt in der Zeile fuer ${MODEL_TAG}"
 
       # ---------------------------------------------------------------------
       # mqvpn holen. BoringSSL und xquic kommen als Submodule von mqvpn mit --
