@@ -1,0 +1,155 @@
+# =============================================================================
+# ci-mqvpn.yml -- baut NUR die TUF-AX3000_V2 mit mqvpn drin
+#
+# Kopieren nach:  .github/workflows/ci-mqvpn.yml   (in DEINEM Fork)
+#
+# Warum das und kein lokaler Build:
+#   1. Der Quellbaum enthaelt .../i2c/aux.c. Windows reserviert AUX als
+#      Geraetenamen, unabhaengig von der Endung -- der Baum ist auf NTFS
+#      nicht auscheckbar.
+#   2. Die Toolchain ist ein 1,8-GB-Docker-Image.
+#   3. gnutons CI baut tuf-ax3000_v2 bereits, inklusive SDK- und UI-Setup.
+#      Wir uebernehmen das und haengen nur mqvpn ein.
+#
+# Nutzung: Branch pushen -> Actions laeuft -> Artifact runterladen.
+# =============================================================================
+name: TUF-AX3000-V2 mit mqvpn
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Modell"
+        default: "tuf-ax3000_v2"
+      ui:
+        description: "UI (tuf = TUI, default = klassisch)"
+        default: "tuf"
+
+jobs:
+  build:
+    name: Firmware bauen
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    container:
+      image: gnuton/asuswrt-merlin-toolchains-docker:latest
+      env:
+        MERLINUPDATE: "y"
+        MODEL: ${{ github.event.inputs.model || 'tuf-ax3000_v2' }}
+        # WICHTIG: die V2 braucht 5.04axhnd.675x. Die V1 waere 5.02axhnd.675x.
+        SDK: "src-rt-5.04axhnd.675x"
+        UI: ${{ github.event.inputs.ui || 'tuf' }}
+        SKIP_BUILD: "false"
+        GIT_REPO: "https://github.com/${{ github.repository }}.git"
+        PROJECT_DIR: "/project/asuswrt-merlin.ng"
+        ARTIFACTS_DIR: "/project/artifacts"
+        CHANGELOG_FILE: "/tmp/CHANGELOG"
+        PROJECTBASEDIR: "/project"
+      options: --user docker
+      volumes:
+        - /mnt:/project
+
+    steps:
+      # ---------------------------------------------------------------------
+      - name: Quellcode holen
+        run: |
+          cd ${PROJECTBASEDIR}
+          if [[ $GITHUB_REF_TYPE == "tag" ]]; then
+            export TAG="${GITHUB_REF#refs/tags/}"
+          else
+            export BRANCH="${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}"
+          fi
+          git clone --depth 1 --branch "${TAG:-$BRANCH}" "$GIT_REPO" asuswrt-merlin.ng
+
+      # ---------------------------------------------------------------------
+      - name: Toolchain fuer SDK setzen
+        run: |
+          echo "----- Space -----"; df -h
+          # 5.04axhnd.675x (die V2) nutzt dieses Env-Skript.
+          source /home/docker/envs/bcm-hnd-ax-4.19.sh
+          sudo ln -sf /home/docker/am-toolchains/brcm-arm-hnd /opt/toolchains
+          echo "----- Cross-Compiler -----"; which aarch64-*-gcc arm-*-gcc 2>/dev/null || true
+
+      # ---------------------------------------------------------------------
+      - name: TUI aktivieren
+        run: |
+          if [[ $UI == "tuf" ]]; then
+            echo "TUF_UI=n -> y"
+            sed -i 's/TUF_UI=n/TUF_UI=y/' ${PROJECT_DIR}/release/src-rt/target.mak
+          fi
+
+      # ---------------------------------------------------------------------
+      # mqvpn holen. BoringSSL und xquic kommen als Submodule von mqvpn mit --
+      # das ist die Reihenfolge, die das mqvpn-CMake erwartet.
+      - name: mqvpn-Quellen holen
+        run: |
+          cd ${PROJECT_DIR}
+          bash integration/fetch-sources.sh
+
+      # ---------------------------------------------------------------------
+      # In den Router-Baum einhaengen (obj-y) und die Regeln bereitstellen.
+      - name: mqvpn einhängen
+        run: |
+          cd ${PROJECT_DIR}
+          cp integration/mqvpn.mk release/${SDK}/mqvpn.mk
+          cd release/${SDK}
+          bash ${PROJECT_DIR}/integration/apply-integration.sh
+          echo "--- Kontrolle: obj-y Eintraege ---"
+          grep -n 'mqvpn' ${PROJECT_DIR}/release/src/router/Makefile || true
+
+      # ---------------------------------------------------------------------
+      # Ab hier ist der Weg derselbe wie in gnutons eigener CI.
+      - name: Build
+        run: |
+          cd ${PROJECT_DIR}/release/${SDK}
+          echo "----- BUILD ${MODEL} -----"
+          make "${MODEL}"
+
+      # ---------------------------------------------------------------------
+      - name: mqvpn-Nachweis
+        if: always()
+        run: |
+          cd ${PROJECT_DIR}
+          echo "=== Ist mqvpn im Image? ==="
+          IMGDIR=${PROJECT_DIR}/release/${SDK}/image
+          ls -alh ${IMGDIR} 2>/dev/null || echo "kein image/ Ordner"
+          for w in ${IMGDIR}/*.w; do
+            [ -f "$w" ] || continue
+            echo "--- $w ---"
+            # mqvpn muss als Datei im Squashfs-Image stecken
+            strings "$w" 2>/dev/null | grep -m3 -E 'usr/sbin/mqvpn' \
+              && echo "  -> mqvpn GEFUNDEN" \
+              || echo "  -> mqvpn NICHT gefunden (Image pruefen!)"
+          done
+
+      - name: Artifact schnueren
+        if: always()
+        run: |
+          mkdir -p "${ARTIFACTS_DIR}"
+          export IMAGE_PATH=${PROJECT_DIR}/release/${SDK}/image/
+          rm -rf ${IMAGE_PATH}/*cferom*
+          files=("${IMAGE_PATH}"/*squashfs.pkgtb "${IMAGE_PATH}"/*.w)
+          found=0
+          if [ ${#files[@]} -gt 0 ]; then
+            for f in "${files[@]}"; do
+              if [ -f "$f" ] && [ "${f##*.}" != "md5" ]; then
+                md5sum "$f" > "$f.md5"
+                cp "$f" "${ARTIFACTS_DIR}"
+                cp "$f.md5" "${ARTIFACTS_DIR}"
+                found=1
+                echo "  hinzugefuegt: $(basename "$f")"
+              fi
+            done
+          fi
+          [ $found -eq 1 ] || echo "KEIN IMAGE ERZEUGT -- Build-Schritte pruefen"
+          ls -alh "${ARTIFACTS_DIR}"
+
+      - name: Archive artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ github.event.inputs.model || 'tuf-ax3000_v2' }}-${{ github.event.inputs.ui || 'tuf' }}-mqvpn
+          path: "/project/artifacts"
+        continue-on-error: true

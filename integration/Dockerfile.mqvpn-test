@@ -1,0 +1,75 @@
+# =============================================================================
+# Dockerfile.mqvpn-test
+#
+# Baut mqvpn in exakt derselben Toolchain, die der gnuton-Firmware-Build
+# benutzt -- aber ohne Router, ohne Flash, ohne Brick-Risiko.
+#
+# Das ist Stufe 1 von 3. Erst wenn das durch ist, lohnt der Firmware-Build.
+#
+#   docker build -f Dockerfile.mqvpn-test -t mqvpn-test .
+#   docker run --rm -it --privileged mqvpn-test
+# =============================================================================
+FROM gnuton/asuswrt-merlin-toolchains-docker:latest
+
+# Dieser Container bringt die asuswrt-Cross-Toolchain mit (armv7/aarch64 fuer
+# die 675x-SDKs). Wir benutzen sie fuer den mqvpn-Teil.
+ENV SDK_ARCH=armv7
+
+# --- Abhaengigkeiten der vier Bausteine -----------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      cmake make git curl ca-certificates \
+      libevent-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# --- Quellen ---------------------------------------------------------------
+RUN git clone --depth 1 --branch stable https://github.com/libevent/libevent.git libevent
+RUN git clone --depth 1 https://github.com/google/boringssl.git boringssl
+RUN git clone --depth 1 https://github.com/mp0rta/xquic.git xquic
+RUN git clone --depth 1 --recurse-submodules https://github.com/mp0rta/mqvpn.git mqvpn
+
+# --- 1) BoringSSL (statisch) -----------------------------------------------
+# Linux-Bau braucht kein Go/NASM/Perl -- nur Windows braucht das.
+RUN mkdir -p boringssl/build && cd boringssl/build && \
+    cmake .. -DCMAKE_BUILD_TYPE=Release \
+             -DBUILD_SHARED_LIBS=OFF \
+             -DCMAKE_POSITION_INDEPENDENT_CODE=ON >/dev/null && \
+    make -j"$(nproc)" ssl crypto >/dev/null && \
+    echo "BoringSSL: $(ls -la libssl.a libcrypto.a | wc -l) libs"
+
+# --- 2) xquic (FEC + BBR2 an, sonst kein Bonding) --------------------------
+RUN mkdir -p /build/xquic/build && cd /build/xquic/build && \
+    cmake .. -DCMAKE_BUILD_TYPE=Release \
+             -DSSL_TYPE=boringssl \
+             -DSSL_PATH=/build/boringssl \
+             -DSSL_LIB_PATH=/build/boringssl/build \
+             -DSSL_INC_PATH=/build/boringssl/include \
+             -DXQC_ENABLE_BBR2=ON -DXQC_ENABLE_FEC=ON -DXQC_ENABLE_XOR=ON >/dev/null && \
+    make -j"$(nproc)" >/dev/null && \
+    echo "xquic: ok"
+
+# --- 3) mqvpn ---------------------------------------------------------------
+# BUILD_TESTING=OFF spart die Testprogramme, HYBRID_TCP_LANE=OFF spart lwIP.
+RUN mkdir -p /build/mqvpn/build && cd /build/mqvpn/build && \
+    cmake .. -DCMAKE_BUILD_TYPE=Release \
+             -DXQUIC_BUILD_DIR=/build/xquic/build \
+             -DBUILD_TESTING=OFF \
+             -DMQVPN_ENABLE_HYBRID_TCP_LANE=OFF >/dev/null && \
+    make -j"$(nproc)" mqvpn && \
+    strip mqvpn && \
+    echo "=== mqvpn gebaut ===" && \
+    ./mqvpn --version 2>/dev/null || ./mqvpn -h 2>&1 | head -5
+
+# --- Abhaengigkeiten anzeigen: muessen statisch sein -----------------------
+RUN echo "--- mqvpn Abhaengigkeiten (sollte 'not a dynamic executable' sein) ---" && \
+    (ldd ./mqvpn/build/mqvpn 2>&1 | head -5 || file ./mqvpn/build/mqvpn) && \
+    ls -lh ./mqvpn/build/mqvpn
+
+# --- upstream E2E-Suite mitlaufen lassen (Stufe 2) -------------------------
+# Das ist dein echter Funktionstest: netns, Multipath, Failover, Flapping,
+# Killswitch, NAT, Reinjection. Kalibriert vom mqvpn-Team selbst.
+COPY run-tests.sh /usr/local/bin/run-tests.sh
+RUN chmod +x /usr/local/bin/run-tests.sh
+ENTRYPOINT ["/usr/local/bin/run-tests.sh"]
+CMD ["all"]
