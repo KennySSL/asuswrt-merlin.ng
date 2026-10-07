@@ -327,21 +327,10 @@ jobs:
       # von 47 Minuten Gesamtlaenge. Da sich an den Quellen zwischen zwei
       # Build-Versuchen nichts aendert, wird das Ergebnis wiederverwendet.
       #
-      # Die Pfade muessen absolut sein: actions/cache expandiert keine
-      # Shell-Variablen, und ${PROJECT_DIR} ist ein Container-Env, kein
-      # GitHub-Kontext. Die Werte muessen mit PROJECT_DIR aus dem
-      # container.env uebereinstimmen -- deshalb beide genannt.
-      - name: mqvpn-Quellen cachen
-        id: mqvpn-cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            /project/asuswrt-merlin.ng/release/src/router/mqvpn
-            /project/asuswrt-merlin.ng/release/src/router/libevent2-2.1.12
-          # hashFiles ueber fetch-sources.sh: aendert sich die Datei, ist der
-          # Cache ungueltig und die Quellen werden neu geholt. Ein fester
-          # String waere hier ein stiller Fehler.
-          key: mqvpn-src-${{ runner.os }}-${{ hashFiles('integration/fetch-sources.sh') }}
+      # actions/cache ist hier bewusst NICHT eingesetzt: der Container laeuft
+      # als User 'docker' und kann den Runner-State nicht schreiben
+      # (EACCES save_state). Das riss den ganzen Bau mit. Quellen werden
+      # deshalb immer frisch geholt; steps.mqvpn-cache.* ist dann leer = 'nein'.
 
       - name: mqvpn-Quellen holen
         run: |
