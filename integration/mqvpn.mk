@@ -72,6 +72,10 @@ MQVPN_CFLAGS      ?= -Os -fPIC -ffunction-sections -fdata-sections $(EXTRACFLAGS
 # -static: asuswrt liefert im ROM keine passende glibc fuer ein fremdes Binary.
 # Das setzt libc.a/libstdc++.a der Toolchain voraus; falls der Cross-Gcc sie
 # nicht mitbringt, MQVPN_LDFLAGS beim Aufruf ueberschreiben.
+# EXTRALDFLAGS wird hier bewusst NICHT angehaengt: das SDK setzt es auf
+# "-lgcc_s", und ein statischer Link hat kein libgcc_s (nur die dynamische
+# Variante). Das liess schon CMakes Compilertest mit "cannot find -lgcc_s"
+# scheitern.
 MQVPN_LDFLAGS     ?= -Wl,--gc-sections -static
 
 # -----------------------------------------------------------------------------
@@ -261,7 +265,7 @@ $(MQVPN_BIN): $(LIBEVENT_LIB) $(LIBEVENT_HDR) $(XQUIC_STATIC) $(XQUIC_SHARED)
 		-DCMAKE_PREFIX_PATH=$(LIBEVENT_PREFIX) \
 		-DBUILD_TESTING=OFF \
 		-DMQVPN_ENABLE_HYBRID_TCP_LANE=OFF \
-		-DCMAKE_EXE_LINKER_FLAGS="$(MQVPN_LDFLAGS) $(EXTRALDFLAGS)" >/dev/null
+		-DCMAKE_EXE_LINKER_FLAGS="$(MQVPN_LDFLAGS)" >/dev/null
 	$(MAKE) -C $(MQVPN_BUILD) $(PARALLEL_BUILD) mqvpn >/dev/null
 	@test -x $(MQVPN_BIN) || { echo "FEHLT: $(MQVPN_BIN)"; exit 1; }
 
