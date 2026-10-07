@@ -1,69 +1,142 @@
 # =============================================================================
-# mqvpn.mk -- Build-Regeln fuer mqvpn (+libevent2, BoringSSL, xquic)
+# mqvpn.mk -- Build-Regeln fuer mqvpn (+ libevent2, BoringSSL, xquic)
 #
-# Diese Datei wird in das SDK-Verzeichnis kopiert:
-#   cd release/src-rt-5.04axhnd.675x
-#   cp mqvpn.mk ./mqvpn.mk
-#   patch -p1 < mqvpn-router-makefile.diff     (registriert mqvpn in obj-y)
-#   include mqvpn.mk                            (oder: make ... mqvpn.mk)
+# Wird von apply-integration.sh nach release/src/router/mqvpn.mk kopiert und
+# aus release/src/router/Makefile (Anker "# Last rule: append openssl dir if
+# used", Zeile 1834) per `include $(TOP)/mqvpn.mk` eingebunden.
 #
-# Idiom folgt exakt dem ipset-7.6-Block aus release/src/router/Makefile:
-#   <name>-configure / <name>/Makefile / <name>: / <name>-install / <name>-clean
+# Reihenfolge ist hier entscheidend: obj-clean und obj-install werden im
+# Router-Makefile erst in Zeile 1841/1842 per foreach aus $(obj-y) abgeleitet.
+# Alles, was dort nicht steht, wird weder gebaut noch installiert -- die
+# Registrierung im obj-y muss also VOR Zeile 1841 stehen.
+#
+# Ab dem Einbindepunkt sind die asuswrt-Variablen exportiert und benutzbar:
+#   $(TOP)            common.mak:10   = $(SRCBASE)/router (= release/src/router)
+#   $(HND_SRC)        router/Makefile:31, absolut
+#   $(INSTALLDIR)     common.mak:88   = targets/$(PROFILE)/fs.install
+#   $(CC)/$(CXX)/$(AR)/$(RANLIB)  common.mak:42-45
+#   $(STRIP)          common.mak:60,  $(READELF) common.mak:56
+#   $(CONFIGURE)      platform.mak:32 = ./configure LD=... --host=arm-buildroot-...
+#   $(PARALLEL_BUILD) platform.mak:667 = -j<Anzahl CPU>
+#
+# Das Idiom ist der ipset-7.6-Block aus release/src/router/Makefile:3069-3095:
+#   <name>/configure -> <name>/Makefile -> <name> -> <name>-install -> <name>-clean
+# ipset holt seine Abhaengigkeit libmnl-1.0.4 als Voraussetzung von `ipset-7.6`
+# und findet sie ueber -I/-L. Genauso werden hier libevent2, BoringSSL und xquic
+# gebaut, und das jeweils naechste Ziel nimmt die Artefakte als echte
+# Datei-Voraussetzung auf. Dadurch ist der Build idempotent: ein zweites
+# `make all` baut nichts neu.
 #
 # KRITISCH -- nicht selbst entscheiden, das ist dokumentierter Fehler #4363
 # (OMR 0.1069 -> 0.1081): Routing ging verloren, VPN-Stillstand mit gruener
 # Statusanzeige. Jede Aenderung hier muss nach dem Bau geprueft werden.
 # =============================================================================
 
-# Pfade kommen aus paths.mk, das fetch-sources.sh erzeugt hat. Falls es fehlt,
-# fallen wir auf die bekannte Submodul-Struktur zurueck.
--include paths.mk
-MQVPN_DIR         ?= $(shell pwd)/release/src/router/mqvpn
+# Pfade kommen aus paths.mk, das fetch-sources.sh neben mqvpn.mk ablegt.
+# Fehlt die Datei, gelten die asuswrt-Vorgaben.
+# Wichtig: NIE `$(shell pwd)` plus `release/src/router/`. Wenn das Router-
+# Makefile laeuft, IST das Arbeitsverzeichnis bereits .../release/src/router --
+# das ergaebe release/src/router/release/src/router (Pfadverdopplung).
+# $(TOP) ist die vom Baum selbst exportierte Variable fuer genau dieses
+# Verzeichnis, und $(HND_SRC) das absolute SDK-Verzeichnis.
+-include $(TOP)/paths.mk
+MQVPN_DIR         ?= $(TOP)/mqvpn
 XQUIC_DIR         ?= $(MQVPN_DIR)/third_party/xquic
 BORINGSSL_DIR     ?= $(XQUIC_DIR)/third_party/boringssl
-LIBEVENT_DIR      ?= $(shell pwd)/release/src/router/libevent2-2.1.12
+LIBEVENT_DIR      ?= $(TOP)/libevent2-2.1.12
 
-# Build-Ausgabe ausserhalb der Quellen, damit ein clean nicht die Sourcen frisst
-BORINGSSL_OUT     = $(shell pwd)/build-boringssl
-XQUIC_OUT         = $(shell pwd)/build-xquic
+# Alles Gebaute liegt ausserhalb des versionierten Quellbaums: $(HND_SRC) ist
+# release/src-rt-5.04axhnd.675x, also landet nichts in .git. Im Nicht-HND-Fall
+# (HND_SRC leer) greift $(TOP) -- dann gibt es auch keinen $(INSTALLDIR)/<name>,
+# in den der BoringSSL-Output nuetzen wuerde.
+MQVPN_BUILD_ROOT  ?= $(if $(HND_SRC),$(HND_SRC)/mqvpn-build,$(TOP)/mqvpn-build)
+LIBEVENT_PREFIX   ?= $(MQVPN_BUILD_ROOT)/deps
+BORINGSSL_OUT     ?= $(MQVPN_BUILD_ROOT)/boringssl
+XQUIC_OUT         ?= $(MQVPN_BUILD_ROOT)/xquic
+MQVPN_BUILD       ?= $(MQVPN_BUILD_ROOT)/mqvpn
 
-MQVPN_CC       ?= $(CC)
-MQVPN_CFLAGS   ?= -Os -fPIC -ffunction-sections -fdata-sections $(EXTRACFLAGS)
-MQVPN_LDFLAGS  ?= -Wl,--gc-sections -static
+# mqvpn liest BORINGSSL_BUILD_DIR und prueft ${BORINGSSL_BUILD_DIR}/ssl/libssl.a
+# (CMakeLists.txt:205-213). Genau diese beiden Dateien erzeugt der BoringSSL-
+# Build in $(BORINGSSL_OUT) -- deshalb wird das Verzeichnis unveraendert
+# durchgereicht und nichts kopiert.
+BORINGSSL_LIB     = $(BORINGSSL_OUT)/ssl/libssl.a
+BORINGSSL_CRYPTO  = $(BORINGSSL_OUT)/crypto/libcrypto.a
+XQUIC_STATIC      = $(XQUIC_OUT)/libxquic-static.a
+XQUIC_SHARED      = $(XQUIC_OUT)/libxquic.so
+LIBEVENT_LIB      = $(LIBEVENT_PREFIX)/lib/libevent.a
+LIBEVENT_HDR      = $(LIBEVENT_PREFIX)/include/event2/event.h
+MQVPN_BIN         = $(MQVPN_BUILD)/mqvpn
+
+MQVPN_CC          ?= $(CC)
+MQVPN_CFLAGS      ?= -Os -fPIC -ffunction-sections -fdata-sections $(EXTRACFLAGS)
+# -static: asuswrt liefert im ROM keine passende glibc fuer ein fremdes Binary.
+# Das setzt libc.a/libstdc++.a der Toolchain voraus; falls der Cross-Gcc sie
+# nicht mitbringt, MQVPN_LDFLAGS beim Aufruf ueberschreiben.
+MQVPN_LDFLAGS     ?= -Wl,--gc-sections -static
 
 # -----------------------------------------------------------------------------
-# 1) libevent2 -- mqvpn bricht ohne das hart ab (CMakeLists: FATAL_ERROR).
-#    Nur die Kern-Teile, kein OpenSSL (BoringSSL deckt TLS ab).
+# 1) libevent2 -- mqvpn bricht ohne das hart ab.
+#
+#    B5: mqvpn/CMakeLists.txt:99-103 (Linux-Zweig):
+#         find_path(EVENT_INCLUDE_DIR event2/event.h)
+#         find_library(EVENT_LIB event)
+#         if(NOT EVENT_LIB)
+#             message(FATAL_ERROR "libevent not found. Install: apt install libevent-dev")
+#    find_library durchsucht <prefix>/lib und <prefix>/lib64 -- nicht
+#    <prefix>/usr/lib. Die alte Regel installierte per --prefix=/usr und
+#    DESTDIR=... nach <deps>/usr/lib; find_library fand dort nichts und die
+#    Konfiguration brach mit FATAL_ERROR ab.
+#    Loesung: libevent wird direkt mit --prefix=$(LIBEVENT_PREFIX) installiert.
+#    Dann liegen die Header in $(LIBEVENT_PREFIX)/include/event2/event.h und
+#    libevent.a in $(LIBEVENT_PREFIX)/lib/libevent.a -- genau die beiden
+#    Stellen, an denen find_path und find_library suchen. -DCMAKE_PREFIX_PATH
+#    zeigt mqvpn in Schritt 4 darauf. Kein Suchpfad-Flag, das CMake nur
+#    verbiegt: der Prefix IST der Ort, an dem installiert wird.
+#
+#    Nur die Kern-Teile, kein OpenSSL -- TLS macht BoringSSL.
 # -----------------------------------------------------------------------------
 libevent2-2.1.12/configure:
 	cd $(LIBEVENT_DIR) && ./autogen.sh
 
 libevent2-2.1.12/Makefile: libevent2-2.1.12/configure
 	cd $(LIBEVENT_DIR) && \
-	CC="$(MQVPN_CC)" \
-	CFLAGS="$(MQVPN_CFLAGS)" \
-	LDFLAGS="$(MQVPN_LDFLAGS)" \
-	./configure --prefix=/usr \
+	$(CONFIGURE) \
+		--prefix=$(LIBEVENT_PREFIX) \
 		--disable-openssl --disable-samples --disable-tests \
+		--disable-libevent-regress \
 		--enable-static --disable-shared --with-pic
 
-libevent2-2.1.12: libevent2-2.1.12/Makefile
+# Der Stamp beweist: configure, make UND make install sind durch. Ohne ihn
+# wuerde ein zweiter Lauf configure wiederholen, nur weil die Artefakte schon
+# da sind -- und libevent-2.1.12-clean setzt das Makefile wieder zurueck.
+$(LIBEVENT_PREFIX)/.libevent-built: libevent2-2.1.12/Makefile
 	$(MAKE) -C $(LIBEVENT_DIR)
-	mkdir -p $(STAGEDIR)/mqvpn-deps/lib $(STAGEDIR)/mqvpn-deps/include
-	$(MAKE) -C $(LIBEVENT_DIR) install DESTDIR=$(STAGEDIR)/mqvpn-deps
+	$(MAKE) -C $(LIBEVENT_DIR) install
+	@test -f $(LIBEVENT_LIB) || { echo "FEHLT: $(LIBEVENT_LIB)"; exit 1; }
+	@test -f $(LIBEVENT_HDR) || { echo "FEHLT: $(LIBEVENT_HDR)"; exit 1; }
+	@touch $@
 
-libevent2-2.1.2-install:
-	mkdir -p $(INSTALLDIR)/mqvpn/usr/lib $(INSTALLDIR)/mqvpn/usr/include
-	cp -a $(STAGEDIR)/mqvpn-deps/lib/*.a $(INSTALLDIR)/mqvpn/usr/lib/
-	cp -a $(STAGEDIR)/mqvpn-deps/include/event2 $(INSTALLDIR)/mqvpn/usr/include/
+$(LIBEVENT_LIB) $(LIBEVENT_HDR): $(LIBEVENT_PREFIX)/.libevent-built
+	@test -f $@ || { echo "FEHLT: $@ (mqvpn-build clean?)"; exit 1; }
+
+# Das Objekt in obj-y. Es traegt die Abhaengigkeit, damit mqvpn nicht selbst
+# raten muss, woher libevent kommt.
+libevent2-2.1.12: $(LIBEVENT_LIB) $(LIBEVENT_HDR)
+
+# obj-install (Makefile:1842) ruft fuer jedes obj-y `<name>-install` auf. mqvpn
+# ist statisch gelinkt, im ROM wird die .a nicht gebraucht -- die Regel
+# existiert nur, damit obj-install nicht ins Leere greift, und sagt das laut.
+libevent2-2.1.12-install:
+	@echo "  SKIP  libevent2-2.1.12-install (Link-Zeit-Abhaengigkeit, statisch in mqvpn gelinkt)"
 
 libevent2-2.1.12-clean:
-	[ ! -d $(LIBEVENT_DIR) ] || $(MAKE) -C $(LIBEVENT_DIR) distclean
+	[ ! -f $(LIBEVENT_DIR)/Makefile ] || $(MAKE) -C $(LIBEVENT_DIR) distclean
+	rm -rf $(LIBEVENT_PREFIX)
 
 # -----------------------------------------------------------------------------
 # 2) BoringSSL -- statisch, nur ssl+crypto. Auf Linux kein Go/NASM/Perl noetig.
 # -----------------------------------------------------------------------------
-boringssl-stage:
+$(BORINGSSL_OUT)/.boringssl-built:
 	mkdir -p $(BORINGSSL_OUT)
 	cd $(BORINGSSL_OUT) && \
 	CC="$(MQVPN_CC)" CXX="$(CXX)" AR=$(AR) RANLIB=$(RANLIB) \
@@ -72,16 +145,40 @@ boringssl-stage:
 		-DCMAKE_BUILD_TYPE=Release \
 		-DCMAKE_POSITION_INDEPENDENT_CODE=ON \
 		-DBUILD_SHARED_LIBS=OFF >/dev/null
-	$(MAKE) -C $(BORINGSSL_OUT) -j$(PARALLEL_BUILD) ssl crypto >/dev/null
-	mkdir -p $(STAGEDIR)/mqvpn-deps/ssl
-	cp -a $(BORINGSSL_OUT)/ssl/libssl.a $(BORINGSSL_OUT)/crypto/libcrypto.a \
-	      $(STAGEDIR)/mqvpn-deps/ssl/
+	$(MAKE) -C $(BORINGSSL_OUT) $(PARALLEL_BUILD) ssl crypto >/dev/null
+	@test -f $(BORINGSSL_LIB) || { echo "FEHLT: $(BORINGSSL_LIB)"; exit 1; }
+	@test -f $(BORINGSSL_CRYPTO) || { echo "FEHLT: $(BORINGSSL_CRYPTO)"; exit 1; }
+	@touch $@
+
+$(BORINGSSL_LIB) $(BORINGSSL_CRYPTO): $(BORINGSSL_OUT)/.boringssl-built
+	@test -f $@ || { echo "FEHLT: $@ (mqvpn-build clean?)"; exit 1; }
+
+boringssl: $(BORINGSSL_LIB) $(BORINGSSL_CRYPTO)
+
+# Reines Link-Zeit-Artefakt: mqvpn bindet ssl+crypto statisch ein, im ROM
+# darf davon nichts liegen.
+boringssl-install:
+	@echo "  SKIP  boringssl-install (Link-Zeit-Abhaengigkeit, statisch in mqvpn gelinkt)"
+
+boringssl-clean:
+	rm -rf $(BORINGSSL_OUT)
 
 # -----------------------------------------------------------------------------
-# 3) xquic -- FEC und XOR sind Pflicht fuer den Scheduler "backup_fec".
+# 3) xquic -- FEC und XOR sind Pflicht fuer den Scheduler "backup_fec",
 #    BBR2 macht aus den WANs ueberhaupt erst Bonding.
+#
+#    Die Abhaengigkeit auf BoringSSL ist keine Dekoration: xquic linkt gegen
+#    libssl.a/libcrypto.a, und xquic/CMakeLists.txt:87-91 prueft jedes Element
+#    von SSL_LIB_PATH auf Existenz und meldet sonst FATAL_ERROR. Deshalb werden
+#    hier die .a-Dateien selbst uebergeben, nicht ihr Verzeichnis -- die alte
+#    Regel hat das Verzeichnis $(STAGEDIR)/mqvpn-deps/ssl gegeben.
+#    Die zweite, indirekte Abhaengigkeit ist mqvpn: xquics configure_file
+#    (CMakeLists.txt:129-131) erzeugt include/xquic/xqc_configure.h im Quellbaum,
+#    und mqvpn includiert genau diese Datei (XQUIC_INCLUDE_DIR,
+#    mqvpn/CMakeLists.txt:46). Also muss xquic mindestens konfiguriert sein,
+#    bevor mqvpn konfiguriert.
 # -----------------------------------------------------------------------------
-xquic-stage: boringssl-stage
+$(XQUIC_OUT)/.xquic-built: $(BORINGSSL_LIB)
 	mkdir -p $(XQUIC_OUT)
 	cd $(XQUIC_OUT) && \
 	CC="$(MQVPN_CC)" CXX="$(CXX)" AR=$(AR) RANLIB=$(RANLIB) \
@@ -90,52 +187,92 @@ xquic-stage: boringssl-stage
 		-DCMAKE_BUILD_TYPE=Release \
 		-DSSL_TYPE=boringssl \
 		-DSSL_PATH=$(BORINGSSL_DIR) \
-		-DSSL_LIB_PATH=$(STAGEDIR)/mqvpn-deps/ssl \
 		-DSSL_INC_PATH=$(BORINGSSL_DIR)/include \
+		-DSSL_LIB_PATH="$(BORINGSSL_LIB);$(BORINGSSL_CRYPTO)" \
+		-DXQC_ENABLE_TESTING=OFF \
 		-DXQC_ENABLE_BBR2=ON \
 		-DXQC_ENABLE_FEC=ON \
 		-DXQC_ENABLE_XOR=ON >/dev/null
-	$(MAKE) -C $(XQUIC_OUT) -j$(PARALLEL_BUILD) >/dev/null
-	mkdir -p $(STAGEDIR)/mqvpn-deps/xquic
-	cp -a $(XQUIC_OUT)/*.a $(STAGEDIR)/mqvpn-deps/xquic/ 2>/dev/null || true
+	$(MAKE) -C $(XQUIC_OUT) $(PARALLEL_BUILD) >/dev/null
+	@test -f $(XQUIC_STATIC) || { echo "FEHLT: $(XQUIC_STATIC)"; exit 1; }
+	@test -f $(XQUIC_SHARED) || { echo "FEHLT: $(XQUIC_SHARED)"; exit 1; }
+	@touch $@
+
+$(XQUIC_STATIC) $(XQUIC_SHARED): $(XQUIC_OUT)/.xquic-built
+	@test -f $@ || { echo "FEHLT: $@ (mqvpn-build clean?)"; exit 1; }
+
+xquic: $(XQUIC_STATIC) $(XQUIC_SHARED)
+
+xquic-install:
+	@echo "  SKIP  xquic-install (Link-Zeit-Abhaengigkeit, statisch in mqvpn gelinkt)"
+
+xquic-clean:
+	rm -rf $(XQUIC_OUT)
 
 # -----------------------------------------------------------------------------
 # 4) mqvpn
-#    -DBUILD_TESTING=OFF           spart Testprogramme und Abhaengigkeiten
+#    -DXQUIC_BUILD_DIR      mqvpn/CMakeLists.txt:48-79: damit importiert mqvpn
+#                           xquic als SHARED (libxquic.so) und -- falls
+#                           vorhanden -- xquic-static als STATIC. xquic-static
+#                           wird bevorzugt (Zeile 186-190), also statisch gelinkt.
+#    -DBORINGSSL_BUILD_DIR  B4: mqvpn/CMakeLists.txt:193-223 liest genau diese
+#                           Variable und sonst nichts. SSL_LIB_PATH und
+#                           SSL_INC_PATH kommen in mqvpns CMakeLists.txt kein
+#                           einziges Mal vor -- die gehoeren zu xquic
+#                           (third_party/xquic/CMakeLists.txt:64-98), wo sie
+#                           in Schritt 3 korrekt gesetzt werden.
+#    -DCMAKE_PREFIX_PATH    zeigt auf den libevent-Prefix aus Schritt 1, damit
+#                           find_path/find_library libevent finden.
+#    -DBUILD_TESTING=OFF    spart die Testprogramme (CMakeLists.txt:856-857).
 #    -DMQVPN_ENABLE_HYBRID_TCP_LANE=OFF
-#                                 lwIP-Hybrid wird fuer den Router nicht gebraucht
+#                           lwIP-Hybrid wird fuer den Router nicht gebraucht.
+#                           ANDROID_CROSS_COMPILE zu setzen waere der andere Weg,
+#                           die libevent-Pflicht zu umgehen (CMakeLists.txt:88),
+#                           aber das Flag schaltet auch CLI und Bind-Layer ab.
 # -----------------------------------------------------------------------------
-mqvpn: libevent2-2.1.12 xquic-stage
-	mkdir -p $(MQVPN_DIR)/build
-	cd $(MQVPN_DIR)/build && \
+$(MQVPN_BIN): $(LIBEVENT_LIB) $(LIBEVENT_HDR) $(XQUIC_STATIC) $(XQUIC_SHARED)
+	mkdir -p $(MQVPN_BUILD)
+	cd $(MQVPN_BUILD) && \
 	CC="$(MQVPN_CC)" CXX="$(CXX)" AR=$(AR) RANLIB=$(RANLIB) STRIP=$(STRIP) \
 	CFLAGS="$(MQVPN_CFLAGS)" CXXFLAGS="$(MQVPN_CFLAGS)" \
-	cmake .. \
+	cmake $(MQVPN_DIR) \
 		-DCMAKE_BUILD_TYPE=Release \
 		-DCMAKE_POSITION_INDEPENDENT_CODE=ON \
 		-DXQUIC_BUILD_DIR=$(XQUIC_OUT) \
-		-DSSL_LIB_PATH=$(STAGEDIR)/mqvpn-deps/ssl \
-		-DSSL_INC_PATH=$(BORINGSSL_DIR)/include \
-		-DCMAKE_PREFIX_PATH=$(STAGEDIR)/mqvpn-deps \
-		-DCMAKE_C_FLAGS="-I$(STAGEDIR)/mqvpn-deps/include" \
-		-DCMAKE_CXX_FLAGS="-I$(STAGEDIR)/mqvpn-deps/include" \
+		-DBORINGSSL_BUILD_DIR=$(BORINGSSL_OUT) \
+		-DCMAKE_PREFIX_PATH=$(LIBEVENT_PREFIX) \
 		-DBUILD_TESTING=OFF \
 		-DMQVPN_ENABLE_HYBRID_TCP_LANE=OFF \
-		-DCMAKE_EXE_LINKER_FLAGS="$(MQVPN_LDFLAGS) -L$(STAGEDIR)/mqvpn-deps/ssl -L$(STAGEDIR)/mqvpn-deps/xquic -L$(STAGEDIR)/mqvpn-deps/lib" >/dev/null
-	$(MAKE) -C $(MQVPN_DIR)/build -j$(PARALLEL_BUILD) mqvpn
+		-DCMAKE_EXE_LINKER_FLAGS="$(MQVPN_LDFLAGS) $(EXTRALDFLAGS)" >/dev/null
+	$(MAKE) -C $(MQVPN_BUILD) $(PARALLEL_BUILD) mqvpn >/dev/null
+	@test -x $(MQVPN_BIN) || { echo "FEHLT: $(MQVPN_BIN)"; exit 1; }
 
-mqvpn-install: mqvpn
-	@echo "=== mqvpn: Installation ins ROM ==="
-	install -D -m 755 $(MQVPN_DIR)/build/mqvpn $(INSTALLDIR)/mqvpn/usr/sbin/mqvpn
-	# statisch gelinkt: keine .so-Abhaengigkeit, aber libstdc++/libgcc muessen
-	# im ROM liegen -- asuswrt hat sie nicht zwingend fuer jeden Prozess
-	$(STRIP) $(INSTALLDIR)/mqvpn/usr/sbin/mqvpn || true
-	mkdir -p $(INSTALLDIR)/mqvpn/usr/lib
-	cp -a $(STAGEDIR)/mqvpn-deps/lib/libevent*.a $(INSTALLDIR)/mqvpn/usr/lib/ 2>/dev/null || true
-	@echo "=== fertig ==="
+mqvpn: $(MQVPN_BIN)
 
-mqvpn-clean:
-	[ ! -d $(MQVPN_DIR)/build ] || $(MAKE) -C $(MQVPN_DIR)/build clean
+# mqvpn-stage: legt das fertige Binary in das Installationsverzeichnis. Das ist
+# die Stufe, die apply-integration.sh an www-install: haengt.
+#
+# Warum nicht der generische %-stage-Mechanismus (Makefile:10125)? Der laeuft
+# `make install DESTDIR=$(STAGEDIR)` im Quellverzeichnis -- mqvpn ist aber ein
+# CMake-Projekt ohne Makefile im Quellbaum. Und $(STAGEDIR)/usr/lib ist der
+# gemeinsame Ort, an dem busybox (Makefile:2848), dropbear (5298) und
+# tcpreplay per -L nachschauen; ein VPN-Binary gehoert dort nicht hin.
+# Der Ort fuer ROM-Inhalte ist $(INSTALLDIR)/<obj-y-name>/: genau daraus tar't
+# gen_target (Makefile:2260) in das Image. Also heisst stage hier: ins
+# Installationsverzeichnis legen, gestrippt.
+mqvpn-stage: mqvpn
+	install -D -m 0755 $(MQVPN_BIN) $(INSTALLDIR)/mqvpn/usr/sbin/mqvpn
+	$(STRIP) $(INSTALLDIR)/mqvpn/usr/sbin/mqvpn
+	@echo "  OK    mqvpn -> $(INSTALLDIR)/mqvpn/usr/sbin/mqvpn"
+
+# Statisch gelinkt: weder libevent.a noch ssl/crypto muessen ins ROM. Die drei
+# Abhaengigkeiten werden gebaut, aber nicht ausgeliefert.
+mqvpn-install: mqvpn-stage
+	@test -x $(INSTALLDIR)/mqvpn/usr/sbin/mqvpn || \
+		{ echo "FEHLT: $(INSTALLDIR)/mqvpn/usr/sbin/mqvpn"; exit 1; }
+
+mqvpn-clean: libevent2-2.1.12-clean boringssl-clean xquic-clean
+	rm -rf $(MQVPN_BUILD)
 
 # -----------------------------------------------------------------------------
 # Nach dem Build MUSS geprueft werden (Fehlerklasse 4363):
@@ -149,5 +286,5 @@ mqvpn-verify:
 		{ echo "FEHLT: $(INSTALLDIR)/mqvpn/usr/sbin/mqvpn"; exit 1; }
 	@file $(INSTALLDIR)/mqvpn/usr/sbin/mqvpn 2>/dev/null || true
 	@echo "--- Abhaengigkeiten (sollte statisch sein) ---"
-	@$(CROSS_LD) $(INSTALLDIR)/mqvpn/usr/sbin/mqvpn 2>&1 | head -3 || true
+	@$(READELF) -d $(INSTALLDIR)/mqvpn/usr/sbin/mqvpn 2>&1 | head -3 || true
 	@echo "OK: mqvpn liegt im ROM"
