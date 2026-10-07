@@ -144,7 +144,8 @@ $(BORINGSSL_OUT)/.boringssl-built:
 	cmake $(BORINGSSL_DIR) \
 		-DCMAKE_BUILD_TYPE=Release \
 		-DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-		-DBUILD_SHARED_LIBS=OFF \n		-DBUILD_TESTING=OFF >/dev/null
+		-DBUILD_SHARED_LIBS=OFF \
+		-DBUILD_TESTING=OFF >/dev/null
 	$(MAKE) -C $(BORINGSSL_OUT) $(PARALLEL_BUILD) ssl crypto >/dev/null
 	@test -f $(BORINGSSL_LIB) || { echo "FEHLT: $(BORINGSSL_LIB)"; exit 1; }
 	@test -f $(BORINGSSL_CRYPTO) || { echo "FEHLT: $(BORINGSSL_CRYPTO)"; exit 1; }
