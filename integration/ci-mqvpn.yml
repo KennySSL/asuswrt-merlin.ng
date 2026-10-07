@@ -518,9 +518,11 @@ jobs:
           echo "----- CMake >= 3.22 fuer BoringSSL -----"
           # Der Container hat CMake 3.16.3; BoringSSL verlangt 3.22+
           # (CMakeLists.txt:15). Ein aktuelles CMake kommt als Tarball ins
-          # Home von 'docker' -- kein Root, kein apt, kein GITHUB_PATH.
+          # ${PROJECT_DIR}/.tools ($HOME ist fuer 'docker' nicht beschreibbar) -- kein Root, kein apt, kein GITHUB_PATH.
           CMAKE_VER=3.28.6
-          CMAKE_DIR="$HOME/cmake-${CMAKE_VER}-linux-x86_64"
+          CMAKE_ROOT="${PROJECT_DIR}/.tools"
+          mkdir -p "$CMAKE_ROOT"
+          CMAKE_DIR="$CMAKE_ROOT/cmake-${CMAKE_VER}-linux-x86_64"
           if [ ! -x "$CMAKE_DIR/bin/cmake" ]; then
             CMAKE_URL="https://github.com/Kitware/CMake/releases/download/v${CMAKE_VER}/cmake-${CMAKE_VER}-linux-x86_64.tar.gz"
             if command -v curl >/dev/null 2>&1; then
@@ -528,7 +530,7 @@ jobs:
             else
               wget -q "$CMAKE_URL" -O /tmp/cmake.tgz
             fi
-            tar -xzf /tmp/cmake.tgz -C "$HOME"
+            tar -xzf /tmp/cmake.tgz -C "$CMAKE_ROOT"
             rm -f /tmp/cmake.tgz
           fi
           export PATH="$CMAKE_DIR/bin:$PATH"
