@@ -41,12 +41,25 @@ echo "==> Ziel: release/src/router"
 # --- 1) libevent2 ---------------------------------------------------------
 # mqvpn bricht ohne das hart ab: CMakeLists Zeile ~101 -> FATAL_ERROR.
 # Nur Android kommt drumherum, dort ist ANDROID_CROSS_COMPILE gesetzt.
+#
+# ACHTUNG: es gibt auf github.com/libevent/libevent KEINEN Branch "stable".
+# Der Branch hiess historisch so nur bei gitlab.com/libevent/libevent, und der
+# GitLab-Smart-HTTP-Zugang blockt unauthentifizierte Abfragen. Deshalb hier
+# fest auf den Release-Tag gepinnt -- das ist ohnehin reproduzierbarer.
 if [ -d "$ROUTER/libevent2-2.1.12/.git" ]; then
   echo "==> [skip] libevent2-2.1.12"
 else
-  echo "==> [hole] libevent2 (stable)"
-  git clone --depth 1 --branch stable https://github.com/libevent/libevent.git \
-       "$ROUTER/libevent2-2.1.12"
+  echo "==> [hole] libevent2 (release-2.1.12-stable)"
+  LIBEVENT_OK=no
+  for ref in release-2.1.12-stable master; do
+    echo "    versuche Tag/Branch: $ref"
+    if git clone --depth 1 --branch "$ref" \
+         https://github.com/libevent/libevent.git "$ROUTER/libevent2-2.1.12" 2>&1; then
+      LIBEVENT_OK=yes; break
+    fi
+    rm -rf "$ROUTER/libevent2-2.1.12"
+  done
+  [ "$LIBEVENT_OK" = yes ] || { echo "    FEHLER: libevent nicht klonbar"; exit 1; }
 fi
 
 # --- 2) mqvpn mit Submodulen --------------------------------------------
