@@ -137,6 +137,12 @@ libevent2-2.1.12-clean:
 # 2) BoringSSL -- statisch, nur ssl+crypto. Auf Linux kein Go/NASM/Perl noetig.
 # -----------------------------------------------------------------------------
 $(BORINGSSL_OUT)/.boringssl-built:
+	# BoringSSL setzt fuer GCC hart -Werror -Wformat=2 -Wformat-signedness ...
+	# (CMakeLists.txt, C_CXX_WARNINGS). Mit GCC 9.2 auf 32-Bit-ARM ist das nie
+	# gegen genau diese Toolchain getestet worden -- eine Warnung waere ein
+	# Abbruch. Warnungen bleiben sichtbar, brechen aber nichts ab.
+	sed -i 's/C_CXX_WARNINGS -Werror /C_CXX_WARNINGS /' $(BORINGSSL_DIR)/CMakeLists.txt
+	@if grep -q "C_CXX_WARNINGS -Werror" $(BORINGSSL_DIR)/CMakeLists.txt; then echo "FEHLER: -Werror in BoringSSL noch aktiv"; exit 1; fi
 	mkdir -p $(BORINGSSL_OUT)
 	cd $(BORINGSSL_OUT) && \
 	CC="$(MQVPN_CC)" CXX="$(CXX)" AR=$(AR) RANLIB=$(RANLIB) \
@@ -180,6 +186,10 @@ boringssl-clean:
 #    bevor mqvpn konfiguriert.
 # -----------------------------------------------------------------------------
 $(XQUIC_OUT)/.xquic-built: $(BORINGSSL_LIB)
+	# xquic haengt -Werror erst NACH unserem CFLAGS an (CMakeLists.txt:109/113);
+	# ein -Wno-error in CFLAGS wird daher uebersteuert. Direkt entfernen.
+	sed -i 's/"-Werror -Wno-unused/"-Wno-unused/' $(XQUIC_DIR)/CMakeLists.txt
+	@if grep -q "\"-Werror" $(XQUIC_DIR)/CMakeLists.txt; then echo "FEHLER: -Werror in xquic noch aktiv"; exit 1; fi
 	mkdir -p $(XQUIC_OUT)
 	cd $(XQUIC_OUT) && \
 	CC="$(MQVPN_CC)" CXX="$(CXX)" AR=$(AR) RANLIB=$(RANLIB) \
