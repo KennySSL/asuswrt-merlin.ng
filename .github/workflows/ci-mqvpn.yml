@@ -501,6 +501,9 @@ jobs:
           echo "----- Files in dir: $(pwd) -----"
 
           echo "----- Setting toolchains for ${SDK} -----"
+          # Die Toolchain-Skripte lesen ungesetzte Variablen (LD_LIBRARY) -- unter
+          # set -u bricht das ab. -u nur fuer das Einlesen ausschalten.
+          set +u
           if [[ ${SDK} == "src-rt-5.04axhnd.675x" ]]; then
             source /home/docker/envs/bcm-hnd-ax-4.19.sh
           elif [[ ${SDK} == "src-rt-5.02axhnd.675x" ]]; then
@@ -510,6 +513,7 @@ jobs:
           else
             echo "SDK not supported"; exit 1
           fi
+          set -u
 
           echo "----- hack-ish fix ---------"
           # Wir laufen als 'docker', nicht als root -- make.common:prebuild_checks
