@@ -11,6 +11,49 @@
 #   3. gnutons CI baut tuf-ax3000_v2 bereits, inklusive SDK- und UI-Setup.
 #      Wir uebernehmen das und haengen nur mqvpn ein.
 #
+# ------------------------------------------------------------------
+# DREI FALLEN, die man hier leicht mit „geht schon" uebersieht:
+#
+# (a) MODEL ist NICHT PROFILE.
+#     `make tuf-ax3000_v2` ist das Modell-Ziel. Das Build-Profil, in dem
+#     alles landet, ist 96756GW:
+#         target.mak:491  export TUF-AX3000_V2 := $(HND-96756_BASE)
+#         target.mak:490  export HND-96756_BASE := ... PROFILE="96756GW" ...
+#     `make 96756GW` ist ausdruecklich KEIN Ziel -- die generische `%:`-Regel
+#     (SDK/Makefile:6504) faengt den Namen ab, macht `router/96756GW` aber
+#     nicht auf und endet mit Exit 0. Man bekommt also KEINEN Fehler, nur ein
+#     leeres Build. Deshalb: MODEL bleibt tuf-ax3000_v2, PROFILE=96756GW.
+#     Die Ablage ist make.common:903  INSTALL_DIR=$(PROFILE_DIR)/fs.install
+#     -> targets/96756GW/fs.install, und buildFS:67 rsynct genau dieses
+#     Verzeichnis in den Squashfs-Rootfs.
+#
+# (b) `$(shell pwd)` im Router-Makefile zeigt auf release/src/router,
+#     NICHT auf release/${SDK}.  Gemessen, nicht geraten:
+#     userspace/Makefile:33 ruft `$(MAKE) -C $(HND_SRC)/router`, und
+#     release/src-rt-5.04axhnd.675x/router ist ein Symlink auf ../src/router
+#     (`ls -l` im Baum). GNU Make loest beim -C den Symlink auf, also zeigt
+#     pwd auf den physischen Pfad. Ein Testbau mit nachgebauter
+#     Symlink-Kette lieferte `CURDIR = .../release/src/router`.
+#     `include $(shell pwd)/mqvpn.mk` (apply-integration.sh:47) verlangt
+#     mqvpn.mk also unter release/src/router/. release/${SDK}/mqvpn.mk ist
+#     der falsche Ort -- harter make-Fehler.
+#
+# (c) PARALLEL_BUILD darf man hier NICHT einfach auf eine Zahl setzen.
+#     Die Variable hat im SDK zwei gegenlaeufige Konventionen:
+#       SDK (router/Makefile:1995, build/Makefile:509):
+#           $(MAKE) $(PARALLEL_BUILD) -C dir   -> erwartet "-j4"
+#       mqvpn.mk:75,98,125:
+#           $(MAKE) -C dir -j$(PARALLEL_BUILD) -> erwartet "4"
+#     Beides gleichzeitig gibt es nicht. Nachgemessen:
+#       PARALLEL_BUILD=-j4 -> mqvpn.mk ruft "make -j-j4" auf
+#                            -> make: the '-j' option requires a positive
+#                               integer argument  (ABBRUCH)
+#       PARALLEL_BUILD=4   -> SDK ruft "make 4 -C dir" auf
+#                            -> make: *** No rule to make target '4'
+#                               (ABBRUCH)
+#     Der SDK hat dafuer eine eigene, saubere Schraube: make.hndrt liest
+#     BRCM_MAX_JOBS und haengt -j$(ACTUAL_MAX_JOBS) an. Die benutzen wir.
+#
 # Nutzung: Branch pushen -> Actions laeuft -> Artifact runterladen.
 # =============================================================================
 name: TUF-AX3000-V2 mit mqvpn
@@ -21,7 +64,7 @@ on:
   workflow_dispatch:
     inputs:
       model:
-        description: "Modell"
+        description: "Modell (= make-Ziel, z.B. tuf-ax3000_v2)"
         default: "tuf-ax3000_v2"
       ui:
         description: "UI (tuf = TUI, default = klassisch)"
@@ -37,9 +80,13 @@ jobs:
       image: gnuton/asuswrt-merlin-toolchains-docker:latest
       env:
         MERLINUPDATE: "y"
+        # make-Ziel. NICHT das Build-Profil -- siehe Kopfkommentar (a).
         MODEL: ${{ github.event.inputs.model || 'tuf-ax3000_v2' }}
         # WICHTIG: die V2 braucht 5.04axhnd.675x. Die V1 waere 5.02axhnd.675x.
         SDK: "src-rt-5.04axhnd.675x"
+        # PROFIL != Modell. TUF-AX3000_V2 baut in targets/96756GW.
+        # Wird unten zur Laufzeit aus target.mak gegengeprueft/aufgeloest.
+        PROFILE: "96756GW"
         UI: ${{ github.event.inputs.ui || 'tuf' }}
         SKIP_BUILD: "false"
         GIT_REPO: "https://github.com/${{ github.repository }}.git"
@@ -81,20 +128,81 @@ jobs:
           ls -d integration .github/workflows 2>&1
 
       # ---------------------------------------------------------------------
-      - name: Toolchain fuer SDK setzen
+      # Frih abklopfen, BEVOR ein 3-Stunden-Build anfaengt. `make 96756GW`
+      # liefert naemlich keinen Fehler, sondern ein leeres Build (siehe (a)).
+      # save_src_config (SDK/Makefile:6249) verlangt genau diese Variable:
+      #   if [ -z '$(TUF-AX3000_V2)' ] ; then echo NO THIS TARGET ...; exit 1
+      # Wir pruefen dieselbe Bedingung selbst und loesen dabei gleich PROFILE
+      # auf, statt es hart zu verdrahten.
+      - name: Modell und Build-Profil gegen den Baum pruefen
         run: |
-          echo "----- Space -----"; df -h
-          # 5.04axhnd.675x (die V2) nutzt dieses Env-Skript.
-          source /home/docker/envs/bcm-hnd-ax-4.19.sh
-          sudo ln -sf /home/docker/am-toolchains/brcm-arm-hnd /opt/toolchains
-          echo "----- Cross-Compiler -----"; which aarch64-*-gcc arm-*-gcc 2>/dev/null || true
+          set -euo pipefail
+          SDKDIR="${PROJECT_DIR}/release/${SDK}"
+          TM="${SDKDIR}/target.mak"
+          echo "--- MODEL=${MODEL}  SDK=${SDK} ---"
+
+          [ -f "$TM" ] || { echo "FEHLER: $TM fehlt"; exit 1; }
+
+          # EXAKT die Umformung aus save_src_config (SDK/Makefile:6249):
+          #   $(shell echo $(1) | tr a-z A-Z)
+          # Die wandelt NUR die Schreibweise. Der Trenner bleibt: aus
+          # tuf-ax3000_v2 wird TUF-AX3000_V2, nicht TUF_AX3000_V2. Mit
+          # einem ownstaendigen '-'->'_' waere die Pruefung hier faelschlich
+          # rot gelaufen.
+          MODEL_UP="$(printf '%s' "${MODEL}" | tr '[:lower:]' '[:upper:]')"
+          if ! grep -qE "^export[[:space:]]+${MODEL_UP}[[:space:]]*:?=" "$TM"; then
+            echo "FEHLER: Variable ${MODEL_UP} existiert in target.mak nicht."
+            echo "       'make ${MODEL}' wuerde mit 'NO THIS TARGET' abbrechen."
+            exit 1
+          fi
+          echo "  OK: Modell-Variable ${MODEL_UP} vorhanden"
+
+          # PROFILE-Kette aufloesen:
+          #   target.mak:491  export TUF-AX3000_V2 := $(HND-96756_BASE)
+          #   target.mak:490  export HND-96756_BASE := ... PROFILE="96756GW"
+          # Mit bash-Regex statt sed: sed braucht hier ein escaping von `$(`,
+          # das beim Herumkopieren des Workflows gern kaputtgeht. Gemessen ist,
+          # dass diese Form ohne Escaping durchlaeuft.
+          # Muster beachten: in grep -E (ERE) ist '\?' ein LITERALES
+          # Fragezeichen, nicht der Quantifier. Richtig ist ':?='.
+          # Ausserdem 'grep -m1' statt 'grep | head -1': unter 'set -o pipefail'
+          # beendet head den Lauf und grep stirbt an SIGPIPE (rc=141), was das
+          # Skript abbrechen wuerde, obwohl alles in Ordnung ist.
+          MODEL_LINE="$(grep -m1 -E "^export[[:space:]]+${MODEL_UP}[[:space:]]*:?=" "$TM" || true)"
+          if [[ "${MODEL_LINE}" =~ \$[(](HND-[0-9A-Za-z_]*)_BASE[)] ]]; then
+            BASE="${BASH_REMATCH[1]}"
+            echo "  Basis-Variable: ${BASE}_BASE"
+            BASE_LINE="$(grep -m1 -E "^export[[:space:]]+${BASE}_BASE[[:space:]]*:?=" "$TM" || true)"
+            if [[ "${BASE_LINE}" =~ PROFILE=\"([^\"]*)\" ]]; then
+              echo "  Profil aus target.mak aufgeloest: ${BASH_REMATCH[1]}"
+              PROFILE="${BASH_REMATCH[1]}"
+            else
+              echo "  WARNUNG: in ${BASE}_BASE kein PROFILE= gefunden, behalte ${PROFILE}"
+            fi
+          else
+            echo "  Hinweis: ${MODEL_UP} verweist nicht auf eine HND-*-_BASE, behalte ${PROFILE}"
+          fi
+
+          PDIR="${SDKDIR}/targets/${PROFILE}"
+          if [ ! -d "$PDIR" ]; then
+            echo "FEHLER: Profilverzeichnis ${PDIR} fehlt."
+            echo "       Vorhandene 96756GW-Varianten:"
+            ls -d "${SDKDIR}/targets/96756GW"* 2>/dev/null | sed 's|^|         |'
+            exit 1
+          fi
+          echo "  OK: ${PDIR}"
+          ls -l "${PDIR}/${PROFILE}" 2>/dev/null | sed 's|^|  |' || true
+
+          # Ab hier ist ${PROFILE} die Wahrheit. Nachfuehrende Schritte lesen
+          # ihn aus GITHUB_ENV, damit MODEL/PROFILE nicht auseinanderlaufen.
+          echo "PROFILE=${PROFILE}" >> "${GITHUB_ENV}"
 
       # ---------------------------------------------------------------------
       - name: TUI aktivieren
         run: |
           if [[ $UI == "tuf" ]]; then
             echo "TUF_UI=n -> y"
-            sed -i 's/TUF_UI=n/TUF_UI=y/' ${PROJECT_DIR}/release/src-rt/target.mak
+            sed -i 's/TUF_UI=n/TUF_UI=y/' ${PROJECT_DIR}/release/src/target.mak
           fi
 
       # ---------------------------------------------------------------------
@@ -102,44 +210,361 @@ jobs:
       # das ist die Reihenfolge, die das mqvpn-CMake erwartet.
       - name: mqvpn-Quellen holen
         run: |
+          set -euo pipefail
           cd ${PROJECT_DIR}
           bash integration/fetch-sources.sh
 
       # ---------------------------------------------------------------------
       # In den Router-Baum einhaengen (obj-y) und die Regeln bereitstellen.
-      - name: mqvpn einhängen
+      #
+      # mqvpn.mk gehoert nach release/src/router/, und zwar weil BEIDE
+      # moeglichen Include-Formen physisch auf diesen Pfad zeigen (Belege in
+      # reports/out-w19w.txt und out-w19zm.txt):
+      #   include $(TOP)/mqvpn.mk          TOP = $(SRCBASE)/router, und
+      #                                   src-rt-*/bcmdrivers/.../src/router
+      #                                   ist ein Symlink auf ../../../../src/router
+      #   include $(shell pwd)/mqvpn.mk    make -C loest den Symlink
+      #                                   ${SDK}/router -> ../src/router auf
+      # release/${SDK}/mqvpn.mk ist also der FALSCHE Ort: dort landet nichts,
+      # was der Include erreicht, und make bricht mit "No such file" ab.
+      - name: mqvpn einhaengen
         run: |
+          set -euo pipefail
           cd ${PROJECT_DIR}
-          cp integration/mqvpn.mk release/${SDK}/mqvpn.mk
-          cd release/${SDK}
+          ROUTER_DIR="release/src/router"
+
+          # 1) mqvpn.mk an die Stelle, wo $(shell pwd) zur make-Zeit zeigt.
+          cp integration/mqvpn.mk "${ROUTER_DIR}/mqvpn.mk"
+          echo "  -> ${ROUTER_DIR}/mqvpn.mk"
+
+          # 2) Zweite Ablage in ${SDK}: deckt den Fall ab, dass jemand den
+          #    Build aus dem SDK-Wurzelverzeichnis faehrt. ueber den Symlink
+          #    ${SDK}/router -> ../src/router ist das dieselbe Datei.
+          cp integration/mqvpn.mk "release/${SDK}/mqvpn.mk"
+          echo "  -> release/${SDK}/mqvpn.mk (ueber Symlink identisch)"
+
+          # 3) paths.mk mit den absoluten Quellpfaden (fetch-sources.sh:203).
+          #    mqvpn.mk macht `-include paths.mk` -- relativ zu pwd, also
+          #    neben mqvpn.mk. Fehlt die Datei, rechnet mqvpn.mk mit
+          #    $(shell pwd)/release/src/router/... und findet nichts.
+          if [ -f integration/paths.mk ]; then
+            cp integration/paths.mk "${ROUTER_DIR}/paths.mk"
+            cp integration/paths.mk "release/${SDK}/paths.mk"
+            echo "  -> paths.mk kopiert"
+          else
+            echo "  WARNUNG: integration/paths.mk fehlt (fetch-sources.sh nicht gelaufen?)"
+          fi
+
+          # apply-integration.sh erwartet, dass es aus dem SDK-Verzeichnis
+          # aufgerufen wird (es nimmt SDK_DIR="$(pwd)"). Deshalb der cd, und
+          # deshalb muss der Kontrollblock unten wieder ueber einen absoluten
+          # Pfad laufen -- ein relatives 'cd release/src/router' von hier aus
+          # gibt es nicht.
+          cd "release/${SDK}"
           bash ${PROJECT_DIR}/integration/apply-integration.sh
+
           echo "--- Kontrolle: obj-y Eintraege ---"
           grep -n 'mqvpn' ${PROJECT_DIR}/release/src/router/Makefile || true
 
-      # ---------------------------------------------------------------------
-      # Ab hier ist der Weg derselbe wie in gnutons eigener CI.
-      - name: Build
-        run: |
-          cd ${PROJECT_DIR}/release/${SDK}
-          echo "----- BUILD ${MODEL} -----"
-          make "${MODEL}"
+          # Harte Vorabpruefung. Wir lesen die Include-Zeile, die
+          # apply-integration.sh gerade geschrieben hat, und pruefen das Ziel
+          # direkt -- statt zu raten. Der Pfad wird absolut ausgewertet, weil
+          # cwd an dieser Stelle ${SDK} ist.
+          #
+          # Beide Schreibweisen muessen funktionieren, weil der Pfad zur
+          # make-Zeit vom Symlink abhaengt (Belege in reports/):
+          #   include $(TOP)/mqvpn.mk          TOP = SRCBASE/router
+          #   include $(shell pwd)/mqvpn.mk    pwd = release/src/router
+          # Beide laufen physisch auf release/src/router/ hinaus -- genau
+          # deshalb ist das der einzige Ort, an dem mqvpn.mk liegen muss.
+          echo "--- Kontrolle: Include-Zeile und Ziel ---"
+          INC_LINE="$(grep -m1 -E '^[[:space:]]*include.*mqvpn\.mk' \
+                     ${PROJECT_DIR}/release/src/router/Makefile || true)"
+          if [ -z "${INC_LINE}" ]; then
+            echo "FEHLER: keine include-Zeile fuer mqvpn.mk im Router-Makefile."
+            echo "       apply-integration.sh hat nicht gegriffen."
+            exit 1
+          fi
+          echo "  Include-Zeile: ${INC_LINE}"
+
+          # Pruefe BEIDE Kandidatenpfade -- unabhaengig davon, welche Form
+          # apply-integration.sh geschrieben hat.
+          ROUTER_ABS="${PROJECT_DIR}/release/src/router"
+          found=0
+          for cand in "${ROUTER_ABS}/mqvpn.mk" \
+                      "${ROUTER_ABS}/../src/router/mqvpn.mk" \
+                      "${PROJECT_DIR}/release/${SDK}/mqvpn.mk"; do
+            if [ -f "$cand" ]; then
+              echo "  OK: $(cd "$(dirname "$cand")" && pwd -P)/mqvpn.mk"
+              found=1
+            fi
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "FEHLER: mqvpn.mk liegt an keinem erwarteten Ort."
+            exit 1
+          fi
 
       # ---------------------------------------------------------------------
+      # Ab hier ist der Weg derselbe wie in gnutons eigener CI
+      # (.github/workflows/github-actions.yml, Schritt "Build").
+      #
+      # BLOCKER: Das `source` der Toolchain-Umgebung und das `make` MUESSTEN
+      # im selben run:-Block stehen. Jeder run:-Block ist eine eigene Shell,
+      # ein `export` aus dem vorigen Block ist hier nicht mehr vorhanden.
+      # gnuton macht es genau so (Zeile 123 und 146 seiner Datei: source ...
+      # direkt vor `make "${MODEL}"`). Ohne das gesetzte CROSS_COMPILE/
+      # TOOLCHAIN findet make keinen aarch64-Compiler.
+      - name: Build
+        run: |
+          set -euo pipefail
+          echo "----- Space available -----"
+          df -h
+          echo "----- I am: $(id) -----"
+          cd ${PROJECT_DIR}/release/${SDK}
+          echo "----- Files in dir: $(pwd) -----"
+
+          echo "----- Setting toolchains for ${SDK} -----"
+          if [[ ${SDK} == "src-rt-5.04axhnd.675x" ]]; then
+            source /home/docker/envs/bcm-hnd-ax-4.19.sh
+          elif [[ ${SDK} == "src-rt-5.02axhnd.675x" ]]; then
+            source /home/docker/envs/bcm-hnd.sh
+          elif [[ ${SDK} == "src-rt-5.02axhnd" ]]; then
+            source /home/docker/envs/bcm-hnd.sh
+          else
+            echo "SDK not supported"; exit 1
+          fi
+
+          echo "----- hack-ish fix ---------"
+          # Wir laufen mit --user root; sudo gibt es nicht ueberall im Image.
+          if [ "$(id -u)" -eq 0 ]; then
+            ln -sf /home/docker/am-toolchains/brcm-arm-hnd /opt/toolchains
+          else
+            sudo ln -sf /home/docker/am-toolchains/brcm-arm-hnd /opt/toolchains
+          fi
+
+          echo "----- Cross-Compiler sichtbar? -----"
+          # 'which' kann keine Glob-Muster -- die alte Zeile
+          #   which aarch64-*-gcc arm-*-gcc
+          # lieferte deshalb immer nur 'true'. Jetzt tatsaechlich pruefen:
+          # ohne Treffer bricht der Build spaeter mit "cannot find -lgcc".
+          FOUND_CC=0
+          for c in aarch64-buildroot-linux-gcc aarch64-unknown-linux-gnu-gcc \
+                   arm-buildroot-linux-gcc arm-none-linux-gnueabi-gcc \
+                   arm-brcm-linux-uclibc-gcc; do
+            if command -v "$c" >/dev/null 2>&1; then
+              echo "  OK: $c -> $(command -v "$c")"; FOUND_CC=1
+            fi
+          done
+          if [ "$FOUND_CC" -eq 0 ]; then
+            echo "  WARNUNG: kein bekannter Cross-Compiler im PATH -- Build wird vermutlich scheitern"
+            echo "  PATH=$PATH"
+          fi
+
+          # --- B2: Parallelitaet deckeln ---------------------------------
+          # make.hndrt haengt -j$(ACTUAL_MAX_JOBS) an den Build an und liest
+          # BRCM_MAX_JOBS; ohne diese Variable nimmt er NUM_CORES. Wir
+          # deckeln auf 4: der Runner hat 2-4 Kerne, und BoringSSL + xquic
+          # uebersetzen C++ -- ein Flood Fill laesst den Runner per OOM-Killer
+          # sterben, statt den Build zu verlangsamen.
+          #
+          # Wichtig: PARALLEL_BUILD setzen wir hier ausdruecklich NICHT, das
+          # gibt es im SDK nicht und es waere zudem inkompatibel mit mqvpn.mk
+          # (siehe Kopfkommentar (c)).
+          #
+          # Gegenprobe zum Umbau von mqvpn.mk:75/98/125 auf `$(PARALLEL_BUILD)`
+          # statt `-j$(PARALLEL_BUILD)` waere die Alternative. Dann waere NUR
+          # die SDK-Form korrekt und mqvpn.mk muesste mitziehen. Solange
+          # mqvpn.mk die alte Form hat, wuerde ein PARALLEL_BUILD=-j4 dort
+          # 'make -j-j4' ergeben und den Build abbrechen -- genau das ist in
+          # reports/out-w19zp.txt ausgefuehrt und belegt.
+          NPROC="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
+          JOBS="$NPROC"
+          [ "$JOBS" -gt 4 ] && JOBS=4
+          [ "$JOBS" -lt 1 ] && JOBS=1
+          echo "----- BUILD ${MODEL} (BRCM_MAX_JOBS=${JOBS}, nproc=${NPROC}) -----"
+
+            # ------------------------------------------------------------------
+            # B3b: router-sysdep fuellen, BEVOR make startet.
+            #
+            # Das SDK legt die modellspezifischen Dateien in
+            #     router-sysdep.$(lowercase_B)/
+            # und erwartet sie danach unter
+            #     router-sysdep/
+            # Der Umbau steht im Makefile bei Zeile 6306ff, in einem
+            # Rezeptschritt, der erst spaeter durchlaufen wird. Der
+            # WLAN-Link-Schritt greift aber vorher ueber
+            #     TOP_PLATFORM = $(SRCBASE)/router-sysdep
+            # darauf zu -- und das ist ein Symlink auf den generischen
+            # Ordner, der nur .dummy enthaelt.
+            #
+            # Gemessene Folge im Lauf 37623491454:
+            #     cp: cannot stat .../bcm96756/main/src/router-sysdep/
+            #         hnd_extra/prebuilt/wfd.o: No such file or directory
+            # fuer wl.o, bdmf.o, rdpa.o, pktrunner.o, nciTMSkmod.o und
+            # weitere. Die Objekte liegen vorhanden und fertig in
+            #     router-sysdep.${MODEL}/hnd_extra/prebuilt/   (49 Dateien)
+            #
+            # Hier passiert genau das, was das Makefile an dieser Stelle
+            # tun wuerde -- nur bevor der erste Zugriff kommt. Sonst waere
+            # das der naechste Blocker nach libevent.
+            # ------------------------------------------------------------------
+            SDKDIR="${PROJECT_DIR}/release/${SDK}"
+            if [ -d "${SDKDIR}/router-sysdep.${MODEL}" ]; then
+              echo "----- router-sysdep aus router-sysdep.${MODEL} fuellen -----"
+              rm -rf "${SDKDIR}/router-sysdep"
+              cp -a "${SDKDIR}/router-sysdep.${MODEL}" "${SDKDIR}/router-sysdep"
+              echo "  Eintraege in router-sysdep : $(ls -A "${SDKDIR}/router-sysdep" 2>/dev/null | wc -l)"
+              echo "  prebuilt-Objekte          : $(ls "${SDKDIR}/router-sysdep/hnd_extra/prebuilt/" 2>/dev/null | wc -l)"
+              if [ ! -f "${SDKDIR}/router-sysdep/hnd_extra/prebuilt/wl.o" ]; then
+                echo "  FEHLER: wl.o weiterhin nicht da -- der Pfad stimmt nicht"
+                exit 1
+              fi
+              echo "  Gegenprobe: hnd_extra/prebuilt/wl.o ist vorhanden"
+            else
+              echo "  FEHLER: ${SDKDIR}/router-sysdep.${MODEL} existiert nicht"
+              ls -d "${SDKDIR}"/router-sysdep.* 2>/dev/null | head -20
+              exit 1
+            fi
+
+          make BRCM_MAX_JOBS="${JOBS}" "${MODEL}"
+
+      # ---------------------------------------------------------------------
+      # B4: Der Nachweis muss ehrlich sein.
+      #
+      # `strings <image>.w` kann nie funktionieren: das .w ist ein xz-
+      # komprimierter Squashfs, die Pfadnamen liegen komprimiert im Stream.
+      # Der alte Schritt meldete deshalb IMMER "mqvpn NICHT gefunden" -- auch
+      # bei einem vollstaendig guten Build. Ein Nachweis, der immer rot ist,
+      # ist kein Nachweis, sondern Rauschen im Log.
+      #
+      # Was stattdessen gilt (im Baum nachgelesen):
+      #   make.common:903      INSTALL_DIR=$(PROFILE_DIR)/fs.install
+      #   buildFS:67           rsync -av --exclude="/lib" $INSTALL_DIR/* $ROOTFS
+      # Also liegt alles, was in targets/${PROFILE}/fs.install/ liegt, 1:1 im
+      # Squashfs-Rootfs. mqvpn.mk:129 installiert nach
+      #   $(INSTALLDIR)/mqvpn/usr/sbin/mqvpn
+      # und router/Makefile:2067-2076 (`%-reinstall`, via userspace/Makefile:35)
+      # zieht das Verzeichnis eine Ebene hoeher auf
+      #   fs.install/usr/sbin/mqvpn
+      # Das ist exakt der Pfad, den router/Makefile:2069-2083 abtastet.
+      #
+      # Geprueft wird deshalb ZWEIFACH:
+      #   1. Pflicht: Datei liegt in fs.install, ist nicht leer und ist ein
+      #      echtes ARM/AArch64-ELF. Ein kaputter Build faellt hier durch.
+      #   2. Bonus: Squashfs wirklich aus dem .w auspacken und nachsehen.
+      #      Nur wenn das Werkzeug da ist -- sonst wird ausdruecklich
+      #      "nicht pruefbar" gesagt und NICHT "gefunden".
+      # Der Schritt laeuft mit if: always(), gibt aber bei Fehlschlag
+      # exit 1. Sonst wuerde der rote Build als gruener Job durchgehen.
       - name: mqvpn-Nachweis
         if: always()
         run: |
-          cd ${PROJECT_DIR}
-          echo "=== Ist mqvpn im Image? ==="
-          IMGDIR=${PROJECT_DIR}/release/${SDK}/image
-          ls -alh ${IMGDIR} 2>/dev/null || echo "kein image/ Ordner"
-          for w in ${IMGDIR}/*.w; do
-            [ -f "$w" ] || continue
-            echo "--- $w ---"
-            # mqvpn muss als Datei im Squashfs-Image stecken
-            strings "$w" 2>/dev/null | grep -m3 -E 'usr/sbin/mqvpn' \
-              && echo "  -> mqvpn GEFUNDEN" \
-              || echo "  -> mqvpn NICHT gefunden (Image pruefen!)"
+          SDKDIR="${PROJECT_DIR}/release/${SDK}"
+          PROFILE_DIR="${SDKDIR}/targets/${PROFILE}"
+          INSTALL_DIR="${PROFILE_DIR}/fs.install"
+          fail=0
+
+          echo "=== 1) Wurde ueberhaupt ein Image gebaut? ==="
+          shopt -s nullglob
+          IMGS=( "${SDKDIR}/image/"*.w "${SDKDIR}/image/"*squashfs.pkgtb "${SDKDIR}/image/"*.trx )
+          if [ ${#IMGS[@]} -eq 0 ]; then
+            echo "  FEHLER: kein Image in ${SDKDIR}/image/"
+            ls -alh "${SDKDIR}/image" 2>/dev/null || echo "  (kein image/-Ordner)"
+            fail=1
+          else
+            ls -alh "${IMGS[@]}"
+          fi
+
+          echo
+          echo "=== 2) Pflicht-Nachweis: mqvpn in ${INSTALL_DIR} ==="
+          # Nach dem reinstall liegt sie hier; die flache Variante deckt den
+          # Fall ab, dass der Schritt %-reinstall nicht gelaufen ist.
+          MQVPN=""
+          for cand in "${INSTALL_DIR}/usr/sbin/mqvpn" "${INSTALL_DIR}/mqvpn/usr/sbin/mqvpn"; do
+            if [ -f "$cand" ]; then MQVPN="$cand"; break; fi
           done
+          if [ -z "$MQVPN" ]; then
+            echo "  FEHLER: mqvpn liegt in KEINER der beiden Ablagen."
+            echo "         Das heisst: der Build hat mqvpn nicht ins ROM gelegt."
+            fail=1
+          else
+            SZ="$(wc -c < "$MQVPN")"
+            echo "  gefunden: $MQVPN (${SZ} Bytes)"
+            if [ "$SZ" -lt 1024 ]; then
+              echo "  FEHLER: Datei ist zu klein fuer ein Binary -- Build kaputt."
+              fail=1
+            fi
+            # ELF-Header pruefen statt auf einen Dateinamen zu vertrauen:
+            #   Offset 0..3   = 7f 45 4c 46  (\x7fELF)
+            #   Offset 18..19 = e_machine
+            # Achtung LITTLE endian: ARM/AArch64-Linux ist ELFDATA2LSB, die
+            # Rohbytes stehen also als '28 00' bzw. 'b7 00'. Mit --endian=big
+            # laesst man sich hier 40/183 gerade als 10240/46864 ausgeben und
+            # wuerde ein vollstaendig gebautes mqvpn als 'falsche
+            # Architektur' ablehnen.
+            MAGIC="$(head -c 4 "$MQVPN" | od -An -tx1 | tr -d ' \n')"
+            MACH_HEX="$(od -An -tx1 -j 18 -N 2 "$MQVPN" 2>/dev/null | tr -d ' \n')"
+            # '2800' = ARM (40), 'b700' = AArch64 (183)
+            case "${MACH_HEX}" in
+              2800|b700) MACH="ARM/AArch64 (${MACH_HEX})" ;;
+              *)         MACH="unbekannt (${MACH_HEX})" ;;
+            esac
+            echo "  ELF-Magic : ${MAGIC} (erwartet 7f454c46)"
+            echo "  e_machine : ${MACH}  [2800=ARM, b700=AArch64]"
+            if [ "${MAGIC}" != "7f454c46" ]; then
+              echo "  FEHLER: kein ELF-Binary -- das ist kein gebautes mqvpn."
+              fail=1
+            elif [ "${MACH_HEX}" != "2800" ] && [ "${MACH_HEX}" != "b700" ]; then
+              echo "  FEHLER: e_machine ist nicht ARM/AArch64 -- falscher"
+              echo "         Cross-Compiler benutzt oder kein Target-Binary."
+              fail=1
+            else
+              echo "  OK: mqvpn liegt als ARM/AArch64-ELF im ROM-Quellverzeichnis."
+            fi
+            command -v file >/dev/null 2>&1 && file "$MQVPN" | sed 's/^/  file: /' || true
+          fi
+
+          echo
+          echo "=== 3) Bonus: Squashfs wirklich aus dem Image auspacken ==="
+          # Der eigentliche Beweis, dass es im ROM steht. Geht nur, wenn
+          # unsquashfs im Image ist -- sonst ehrlich 'nicht pruefbar'.
+          if [ ${#IMGS[@]} -eq 0 ]; then
+            echo "  uebersprungen: kein Image zum Entpacken."
+          elif ! command -v unsquashfs >/dev/null 2>&1; then
+            echo "  NICHT PRUEFBAR: unsquashfs fehlt im Container."
+            echo "  Das ist kein Fehlschlag -- Schritt 2 ist der Pflichtnachweis."
+          else
+            IMG="${IMGS[0]}"
+            TMP="$(mktemp -d)"
+            # Squashfs-Superblock beginnt mit 'hsqs' (little endian). Wir
+            # suchen alle Kandidaten und testen jeden mit unsquashfs -s, bis
+            # einer eine gueltige Superblock-Antwort liefert -- sonst haetten
+            # wir nur geraten.
+            FOUND=0
+            for off in $(grep -aob 'hsqs' "$IMG" 2>/dev/null | cut -d: -f1 | head -5); do
+              dd if="$IMG" of="${TMP}/sq.img" bs=1 skip="$off" 2>/dev/null || continue
+              if unsquashfs -s "${TMP}/sq.img" >/dev/null 2>&1; then
+                echo "  Squashfs gefunden ab Offset ${off}"
+                if unsquashfs -ll "${TMP}/sq.img" 2>/dev/null | grep -q 'usr/sbin/mqvpn'; then
+                  echo "  -> mqvpn GEFUNDEN im ausgepackten Squashfs"
+                  unsquashfs -ll "${TMP}/sq.img" 2>/dev/null | grep 'usr/sbin/mqvpn' | sed 's/^/     /'
+                  FOUND=1
+                else
+                  echo "  -> mqvpn NICHT im Squashfs (Datei fehlt im ROM!)"
+                fi
+                break
+              fi
+            done
+            [ "$FOUND" -eq 0 ] && echo "  -> kein auspackbarer Squashfs im Image gefunden."
+            rm -rf "$TMP"
+          fi
+
+          echo
+          if [ "$fail" -ne 0 ]; then
+            echo "=== MQVPN-NACHWEIS FEHLGESCHLAGEN ==="
+            exit 1
+          fi
+          echo "=== MQVPN-NACHWEIS OK ==="
 
       - name: Artifact schnueren
         if: always()
