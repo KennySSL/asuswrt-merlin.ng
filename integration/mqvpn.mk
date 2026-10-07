@@ -123,9 +123,16 @@ $(LIBEVENT_PREFIX)/.libevent-built: libevent2-2.1.12/Makefile
 $(LIBEVENT_LIB) $(LIBEVENT_HDR): $(LIBEVENT_PREFIX)/.libevent-built
 	@test -f $@ || { echo "FEHLT: $@ (mqvpn-build clean?)"; exit 1; }
 
+# WICHTIG: Die vier Sammelziele unten haben bewusst ein leeres Rezept (@:).
+# Ohne Rezept zieht make das generische "%:"-Muster des SDK-Makefiles heran
+# (router/Makefile:10121). Das fand release/src/router/mqvpn/ (ein
+# CMake-Projekt ohne Makefile) und rief "./configure" auf -> Error 127,
+# NACHDEM mqvpn schon fertig gebaut war.
+
 # Das Objekt in obj-y. Es traegt die Abhaengigkeit, damit mqvpn nicht selbst
 # raten muss, woher libevent kommt.
 libevent2-2.1.12: $(LIBEVENT_LIB) $(LIBEVENT_HDR)
+	@:
 
 # obj-install (Makefile:1842) ruft fuer jedes obj-y `<name>-install` auf. mqvpn
 # ist statisch gelinkt, im ROM wird die .a nicht gebraucht -- die Regel
@@ -172,6 +179,7 @@ $(BORINGSSL_LIB) $(BORINGSSL_CRYPTO): $(BORINGSSL_OUT)/.boringssl-built
 	@test -f $@ || { echo "FEHLT: $@ (mqvpn-build clean?)"; exit 1; }
 
 boringssl: $(BORINGSSL_LIB) $(BORINGSSL_CRYPTO)
+	@:
 
 # Reines Link-Zeit-Artefakt: mqvpn bindet ssl+crypto statisch ein, im ROM
 # darf davon nichts liegen.
@@ -224,6 +232,7 @@ $(XQUIC_STATIC) $(XQUIC_SHARED): $(XQUIC_OUT)/.xquic-built
 	@test -f $@ || { echo "FEHLT: $@ (mqvpn-build clean?)"; exit 1; }
 
 xquic: $(XQUIC_STATIC) $(XQUIC_SHARED)
+	@:
 
 xquic-install:
 	@echo "  SKIP  xquic-install (Link-Zeit-Abhaengigkeit, statisch in mqvpn gelinkt)"
@@ -270,6 +279,7 @@ $(MQVPN_BIN): $(LIBEVENT_LIB) $(LIBEVENT_HDR) $(XQUIC_STATIC) $(XQUIC_SHARED)
 	@test -x $(MQVPN_BIN) || { echo "FEHLT: $(MQVPN_BIN)"; exit 1; }
 
 mqvpn: $(MQVPN_BIN)
+	@:
 
 # mqvpn-stage: legt das fertige Binary in das Installationsverzeichnis. Das ist
 # die Stufe, die apply-integration.sh an www-install: haengt.
