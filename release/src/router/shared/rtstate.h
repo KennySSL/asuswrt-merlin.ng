@@ -16,6 +16,32 @@ enum wan_unit_e {
 	WAN_UNIT_FIRST=0,
 #if defined(RTCONFIG_DUALWAN) || defined(RTCONFIG_USB_MODEM)
 	WAN_UNIT_SECOND,
+	/* WAN3 (KennySSL): dritter WAN-Unit, fuer den TUF-AX3000 V2
+	 * als LAN-Port konfigurierbar. Diese Firmware wird nur fuer
+	 * dieses eine Modell gebaut, deshalb ohne #if-Guard.
+	 *
+	 * Speicherfehler sind nicht zu erwarten: die Arrays in wanduck.h
+	 * sind [WAN_UNIT_MAX] und wachsen mit. Ueber den ganzen Baum
+	 * (256 Verwendungen) sind alle Bereichsguards gegen WAN_UNIT_MAX
+	 * formuliert, nicht gegen eine literale 2, und kein [2]-Array
+	 * wird ueber eine WAN-Unit indiziert.
+	 *
+	 * ACHTUNG -- der Failover ist damit NICHT fertig:
+	 * get_next_unit()/get_last_unit() rechnen zwar modular korrekt
+	 * ((u+1)%WAN_UNIT_MAX), aber der FO/FB-Pfad unterstuetzt nur zwei
+	 * Einheiten. wanduck.h:230 haelt nur ein einziges other_wan_unit,
+	 * und WAN_FB_UNIT ist fest auf WAN_UNIT_FIRST gesetzt
+	 * (wanduck.c:3408). Ebenso vergibt shared.h:3762 fuer Unit 2 kein
+	 * Switch-Cap-Bit, weil es nur PRIMARY und SECONDARY kennt.
+	 *
+	 * heisst: WAN3 laesst sich konfigurieren und routen, der Failover
+	 * darauf ist OFFEN. Siehe integration/reports/w5-wanduck-audit.md
+	 * und reports/w7-enum-ripple.md.
+	 *
+	 * get_dualwan_by_unit() in rtstate.c liest wans_dualwan per foreach
+	 * und akzeptiert damit beliebig viele Tokens ("wan lan lan").
+	 */
+	WAN_UNIT_THIRD,
 #endif
 	WAN_UNIT_MAX
 };

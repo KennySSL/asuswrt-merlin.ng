@@ -2654,11 +2654,49 @@ void init_switch()
 #elif defined(RTAX9000)
 			int ports[6] = { 0, 1, 2, 3, 4, 5 };
 #elif defined(TUFAX3000_V2) || defined(RTAXE7800)
-			int ports[5] = { 0, 1, 2, 3, 4 };
-			if (nvram_get_int("wans_extwan")) {
-				ports[0] = 1;
-				ports[1] = 0;
-			}
+	/* --- WAN3 (KennySSL), nur fuer den TUF-AX3000 V2 ---------------
+	 * Diese Firmware wird ausschliesslich fuer dieses eine Modell
+	 * gebaut (make tuf-ax3000_v2). Deshalb kein #if defined(...) und
+	 * keine Guards: es gibt keinen zweiten Build zu schuetzen.
+	 *
+	 * ports[] bleibt physisch {0,1,2,3,4} = 2,5G an Port 0, danach
+	 * vier 1G. Die Zuordnung Port -> WAN/LAN passiert NICHT hier,
+	 * sondern in den beiden Schleifen weiter unten (lanports und
+	 * wanports). Deshalb ist an dieser Stelle nur noetig, die beiden
+	 * Betriebsarten ASUS-Dual-WAN und WAN3 gegeneinander
+	 * abzugrenzen -- sonst tauscht der Extwan-Zweig ports[0] und
+	 * ports[1], und der Wan3-Zweig macht es sofort wieder rueckgaengig,
+	 * sodass Port 0 zweimal im Array stuende.
+	 *
+	 * wan3_ports ist die Reihenfolge, in der belegte Units die 1G
+	 * Ports bekommen: WAN1 -> 1, WAN2 -> 2, WAN3 -> 3. Die 2,5G
+	 * wandert dadurch automatisch in die LAN-Gruppe.
+	 */
+	int ports[5] = { 0, 1, 2, 3, 4 };
+	/* WAN-Reihenfolge im WAN3-Betrieb: die drei 1G-Ports */
+	int wan3_ports[3] = { 1, 2, 3 };
+	int wan3_n = nvram_get_int("wans_wan3_ports");
+	/* Zaehler der belegten WAN3-Ports, s.u. in beiden Schleifen */
+	int wan3_index = 0;
+	/* Zahl der belegten WAN3-Ports. Wird VOR der lanports-Schleife
+	 * ermittelt, weil lanports vor wanports gebaut wird und die
+	 * Auslassregel sonst nicht wuesste, wie viele Ports zu WAN werden. */
+	int wan3_used = 0;
+	
+	if (wan3_n >= 1) {
+		/* WAN3 und ASUS-Dual-WAN schliessen sich aus. Wer WAN3
+		 * konfiguriert hat, will die 1G-Ports als WANs, nicht einen
+		 * einzelnen LAN-Port als zweiten WAN. */
+		ports[0] = 0;
+		ports[1] = 1;
+		ports[2] = 2;
+		ports[3] = 3;
+		ports[4] = 4;
+	}
+	else if (nvram_get_int("wans_extwan")) {
+		ports[0] = 1;
+		ports[1] = 0;
+	}
 #elif defined(RTAX1800)
 			int ports[5] = { 0, 1, 2, 3, 4 };
 #elif defined(RPAX56) || defined(RPAX58)
@@ -2678,13 +2716,66 @@ void init_switch()
 			eval("ethswctl", "-c", "setlinkstatus", "-n", "0", "-p", "1", "-x", "1", "-y", "1000", "-z", "1");
 #endif
 #endif
-			if (get_wans_dualwan() & WANSCAP_LAN) {
-				wancfg = nvram_get_int("wans_lanport");
+	/* WAN3: wie viele Ports werden fuer WAN gebraucht? lanports wird
+	 * vor wanports gebaut, deshalb muss das vorher feststehen --
+	 * sonst wuerde lanports pauschal alle drei WAN3-Ports aussparen
+	 * und ein bei zwei belegten WANs freier Port faellt aus beiden
+	 * Listen heraus. Gezaehlt werden nur WAN- und LAN-Typen; DSL und
+	 * USB belegen keinen physischen Port und duerfen keinen Slot
+	 * verbrauchen. */
+	for (i = WAN_UNIT_FIRST; i < WAN_UNIT_MAX && wan3_used < ARRAYSIZE(wan3_ports); ++i) {
+		if (get_dualwan_by_unit(i) == WANS_DUALWAN_IF_WAN
+		 || get_dualwan_by_unit(i) == WANS_DUALWAN_IF_LAN)
+			wan3_used++;
+	}
+
+			/* WAN3 (KennySSL), nur fuer den TUF-AX3000 V2.
+			 *
+			 * Der WAN3-Betrieb wird hier MITGETRACHT, auch wenn
+			 * get_wans_dualwan() kein WANSCAP_LAN liefert. Das ist der Punkt,
+			 * an dem es vorher kippte: bei wans_dualwan = "wan wan wan", also
+			 * drei echten WANs statt drei LAN-Ports, ist WANSCAP_LAN 0. Der
+			 * Zweig griff dann nicht, und der else-Zweig darunter setzt
+			 * lanports hart auf "1 2 3 4". Das ueberlappt wanports "1 2 3" --
+			 * Ports 1, 2 und 3 waeren LAN und WAN zugleich.
+			 *
+			 * Der Rumpf ist fuer beide Faelle derselbe und laesst sich deshalb
+			 * teilen. Der else-Zweig bleibt fuer den Normalbetrieb unberuehrt.
+			 */
+			if ((get_wans_dualwan() & WANSCAP_LAN) || (wan3_n >= 1)) {
+				/* Im WAN3-Betrieb ist wancfg bedeutungslos: es beschreibt den
+				 * ASUS-Dual-WAN-Fall mit EINEM LAN-Port als zweitem WAN. Der
+				 * wird ohnehin nicht ausgewertet, aber auf 0 zu setzen sorgt
+				 * dafuer, dass ports[wancfg] notfalls ports[0] liefert statt
+				 * eines zufaelligen Werts aus NVRAM. */
+				wancfg = (wan3_n >= 1) ? 0 : nvram_get_int("wans_lanport");
 
 				memset(buf, 0, sizeof(buf));
 				ptr = buf;
-				for (i = 1; i < ARRAYSIZE(ports); ++i) {
-					if (i == wancfg)
+				/* WAN3: die 2,5G (Port 0) wandert zurueck ins LAN, also
+				 * beginnt die Schleife bei 0 statt bei 1. */
+				for (i = (wan3_n >= 1) ? 0 : 1; i < ARRAYSIZE(ports); ++i) {
+					/* WAN3 (KennySSL), nur fuer den TUF-AX3000 V2.
+					 *
+					 * wancfg (NVRAM wans_lanport) beschreibt den ASUS-Dual-WAN-
+					 * Fall: EIN LAN-Port dient als zweiter WAN. Im WAN3-Betrieb
+					 * sind es drei, und wancfg waere bedeutungslos. Er darf dort
+					 * nicht greifen -- bei wancfg 0 verliert die 2,5G ihr LAN,
+					 * bei wancfg 4 fehlt Port 4 in beiden Listen.
+					 *
+					 * Die WAN3-Ports sind ausserdem WAN, nicht LAN. Ohne diese
+					 * Auslassregel laegen ports 2 und 3 gleichzeitig in lanports
+					 * und wanports, und ein Port kann nicht beides sein. Gezaehlt
+					 * wird nur ueber die tatsaechlich belegten Slots (wan3_used). */
+					int j, skip = (wan3_n >= 1) ? 0 : (i == wancfg);
+
+					if (wan3_n >= 1) {
+						for (j = 0; j < wan3_used; ++j)
+							if (ports[i] == wan3_ports[j])
+								skip = 1;
+					}
+
+					if (skip)
 						continue;
 
 					len = strlen(buf);
@@ -2722,7 +2813,31 @@ void init_switch()
 			memset(buf, 0, sizeof(buf));
 			for (i = WAN_UNIT_FIRST, ptr = buf; ((tmp_type = get_dualwan_by_unit(i)) != WANS_DUALWAN_IF_NONE) && (i < WAN_UNIT_MAX) && (wancfg < ARRAYSIZE(ports)); ++i) {
 				len = strlen(buf);
-				if (tmp_type == WANS_DUALWAN_IF_WAN)
+				/* WAN3 (KennySSL), nur fuer den TUF-AX3000 V2: die Zuordnung
+				 * Unit -> Port wird hier positionsbasiert aufgebaut.
+				 *
+				 * Das Original kann nur EINEN WAN- und EINEN LAN-Port vergeben:
+				 * ports[0] ist fuer jeden WANS_DUALWAN_IF_WAN konstant, und
+				 * wancfg steht nur im for-Kopf und wird nie hochgezaehlt,
+				 * ports[wancfg] liefert also ebenfalls denselben Port.
+				 *
+				 * WAN- und LAN-Typ werden hier gleich behandelt. Das ist
+				 * entscheidend: laesst man den WAN-Typ auf ports[0] durch,
+				 * laege die 2,5G als WAN1 auf Port 0 und die drei 1G-Ports
+				 * waeren es nicht.
+				 *
+				 * Der Zaehler sitzt bewusst in diesem Zweig und nicht am Ende
+				 * des Koerpers: DSL und USB erscheinen als -1 und belegen
+				 * keinen Slot. Andernfalls bekaeme der erste echte WAN
+				 * Port 2 statt Port 1. */
+				if (wan3_n >= 1 && wan3_index < ARRAYSIZE(wan3_ports)
+				    && (tmp_type == WANS_DUALWAN_IF_WAN
+				     || tmp_type == WANS_DUALWAN_IF_LAN)) {
+					snprintf(ptr, sizeof(buf)-len, "%s%d", (len > 0)?" ":"",
+						wan3_ports[wan3_index]);
+					wan3_index++;
+				}
+				else if (tmp_type == WANS_DUALWAN_IF_WAN)
 					snprintf(ptr, sizeof(buf)-len, "%s%d", (len > 0)?" ":"", ports[0]);
 				else if (tmp_type == WANS_DUALWAN_IF_LAN)
 					snprintf(ptr, sizeof(buf)-len, "%s%d", (len > 0)?" ":"", ports[wancfg]);
