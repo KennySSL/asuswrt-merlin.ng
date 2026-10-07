@@ -153,6 +153,13 @@ $(BORINGSSL_OUT)/.boringssl-built:
 		-DBUILD_SHARED_LIBS=OFF \
 		-DBUILD_TESTING=OFF >/dev/null
 	$(MAKE) -C $(BORINGSSL_OUT) $(PARALLEL_BUILD) ssl crypto >/dev/null
+	# Neuere BoringSSL-Staende legen libssl.a/libcrypto.a ins Build-Wurzelverzeichnis
+	# (ssl und crypto sind Top-Level-Targets ohne eigenes Ausgabeverzeichnis);
+	# aeltere in ssl/ und crypto/. Unten wird ssl/ und crypto/ erwartet --
+	# mqvpns CMake kennt beide Layouts, xquic bekommt die Pfade von hier.
+	mkdir -p $(BORINGSSL_OUT)/ssl $(BORINGSSL_OUT)/crypto
+	[ -f $(BORINGSSL_LIB) ] || cp -f $(BORINGSSL_OUT)/libssl.a $(BORINGSSL_LIB)
+	[ -f $(BORINGSSL_CRYPTO) ] || cp -f $(BORINGSSL_OUT)/libcrypto.a $(BORINGSSL_CRYPTO)
 	@test -f $(BORINGSSL_LIB) || { echo "FEHLT: $(BORINGSSL_LIB)"; exit 1; }
 	@test -f $(BORINGSSL_CRYPTO) || { echo "FEHLT: $(BORINGSSL_CRYPTO)"; exit 1; }
 	@touch $@
