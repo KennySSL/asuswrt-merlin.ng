@@ -383,6 +383,49 @@ jobs:
           [ "$JOBS" -lt 1 ] && JOBS=1
           echo "----- BUILD ${MODEL} (BRCM_MAX_JOBS=${JOBS}, nproc=${NPROC}) -----"
 
+            # ------------------------------------------------------------------
+            # B3b: router-sysdep fuellen, BEVOR make startet.
+            #
+            # Das SDK legt die modellspezifischen Dateien in
+            #     router-sysdep.$(lowercase_B)/
+            # und erwartet sie danach unter
+            #     router-sysdep/
+            # Der Umbau steht im Makefile bei Zeile 6306ff, in einem
+            # Rezeptschritt, der erst spaeter durchlaufen wird. Der
+            # WLAN-Link-Schritt greift aber vorher ueber
+            #     TOP_PLATFORM = $(SRCBASE)/router-sysdep
+            # darauf zu -- und das ist ein Symlink auf den generischen
+            # Ordner, der nur .dummy enthaelt.
+            #
+            # Gemessene Folge im Lauf 37623491454:
+            #     cp: cannot stat .../bcm96756/main/src/router-sysdep/
+            #         hnd_extra/prebuilt/wfd.o: No such file or directory
+            # fuer wl.o, bdmf.o, rdpa.o, pktrunner.o, nciTMSkmod.o und
+            # weitere. Die Objekte liegen vorhanden und fertig in
+            #     router-sysdep.${MODEL}/hnd_extra/prebuilt/   (49 Dateien)
+            #
+            # Hier passiert genau das, was das Makefile an dieser Stelle
+            # tun wuerde -- nur bevor der erste Zugriff kommt. Sonst waere
+            # das der naechste Blocker nach libevent.
+            # ------------------------------------------------------------------
+            SDKDIR="${PROJECT_DIR}/release/${SDK}"
+            if [ -d "${SDKDIR}/router-sysdep.${MODEL}" ]; then
+              echo "----- router-sysdep aus router-sysdep.${MODEL} fuellen -----"
+              rm -rf "${SDKDIR}/router-sysdep"
+              cp -a "${SDKDIR}/router-sysdep.${MODEL}" "${SDKDIR}/router-sysdep"
+              echo "  Eintraege in router-sysdep : $(ls -A "${SDKDIR}/router-sysdep" 2>/dev/null | wc -l)"
+              echo "  prebuilt-Objekte          : $(ls "${SDKDIR}/router-sysdep/hnd_extra/prebuilt/" 2>/dev/null | wc -l)"
+              if [ ! -f "${SDKDIR}/router-sysdep/hnd_extra/prebuilt/wl.o" ]; then
+                echo "  FEHLER: wl.o weiterhin nicht da -- der Pfad stimmt nicht"
+                exit 1
+              fi
+              echo "  Gegenprobe: hnd_extra/prebuilt/wl.o ist vorhanden"
+            else
+              echo "  FEHLER: ${SDKDIR}/router-sysdep.${MODEL} existiert nicht"
+              ls -d "${SDKDIR}"/router-sysdep.* 2>/dev/null | head -20
+              exit 1
+            fi
+
           make BRCM_MAX_JOBS="${JOBS}" "${MODEL}"
 
       # ---------------------------------------------------------------------
